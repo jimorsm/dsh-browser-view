@@ -344,3 +344,28 @@ describe('the rtc-offer command through the frame gate', () => {
     expect(events.filter(event => event.kind === 'error').length).toBe(1)
   })
 })
+
+describe('the stream command through the frame gate', () => {
+  it('a pause reaches the backend as a boolean flag', async () => {
+    // Given a stub backend and a recording sink
+    const backend = new StubBackend()
+    const { sink } = recordingSink()
+    // When a panel reports itself hidden
+    const command = { v: 1, kind: 'stream', enabled: false }
+    const next = await handleClientFrame(backend, sink, JSON.stringify(command), false)
+    // Then it is dispatched unchanged
+    expect(next).toBe('accept')
+    expect(backend.commands).toEqual([command])
+  })
+
+  it('a stream command without a boolean is refused with an error event', async () => {
+    // Given a stub backend
+    const backend = new StubBackend()
+    const { events, sink } = recordingSink()
+    // When the flag is missing
+    await handleClientFrame(backend, sink, JSON.stringify({ v: 1, kind: 'stream' }), false)
+    // Then the gate refuses it
+    expect(backend.commands).toEqual([])
+    expect(events.filter(event => event.kind === 'error').length).toBe(1)
+  })
+})

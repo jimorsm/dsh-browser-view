@@ -38,6 +38,9 @@ import {
   type ElementTarget,
 } from '../core/actions.ts'
 import {
+  DEFAULT_CAPTURE_MAX,
+  DEFAULT_FRAME_FORMAT,
+  type FrameImageFormat,
   DEFAULT_JPEG_QUALITY,
   DEFAULT_VIEWPORT,
   type BrowserActionTrace,
@@ -49,6 +52,23 @@ import {
   type BrowserViewCommand,
   type BrowserViewEvent,
 } from '../core/protocol.ts'
+
+/**
+ * Smallest gap between two frames pushed to the panels, while nobody is
+ * interacting: about 15 fps. A screencast follows the compositor and reaches
+ * 60 fps on an animated page, where the picture is worth far less than the
+ * bandwidth - a heavy page measured 4.4-5.2 MB/s at full rate.
+ */
+const FRAME_MIN_INTERVAL_MS = 66
+
+/**
+ * Smallest gap right after input: about 30 fps. Someone who just clicked is
+ * watching the result, so the extra frames are bought back for a moment.
+ */
+const INTERACTIVE_FRAME_INTERVAL_MS = 33
+
+/** How long one input gesture keeps the interactive frame rate. */
+const INTERACTIVE_WINDOW_MS = 3_000
 
 /** One attached panel socket as the service sees it. */
 export interface BrowserViewSink {
@@ -94,12 +114,49 @@ export interface BrowserSession {
   dispose(): Promise<void>
 }
 
+/** What the service needs from one sink's frame relay. */
+export interface FrameRelay {
+  /** Whether the channel is open and frames may travel over it. */
+  readonly open: boolean
+  /**
+   * Accept a panel's offer.
+   * @param offerSdpJson - the panel's description as JSON.
+   * @param onClosed - called when the connection dies.
+   * @returns the answer description as JSON.
+   */
+  acceptOffer(offerSdpJson: string, onClosed: () => void): Promise<string>
+  /**
+   * Hand one frame to the channel.
+   * @returns whether the whole frame travelled.
+   */
+  sendFrame(seq: number, image: Buffer): boolean
+  /** Release the connection. */
+  dispose(): void
+}
+
 /** Construction options. */
 export interface BrowserViewServiceOptions {
   /** JPEG quality for frames and screenshots. @default DEFAULT_JPEG_QUALITY */
   jpegQuality?: number
   /** Viewport pinned on every tab. @default DEFAULT_VIEWPORT */
   viewport?: { width: number; height: number }
+  /** Frame encoding requested from CDP. @default DEFAULT_FRAME_FORMAT */
+  frameFormat?: FrameImageFormat
+  /** Capture box the frame is fitted into. @default DEFAULT_CAPTURE_MAX */
+  captureMax?: { width: number; height: number }
+  /**
+   * Smallest gap between two frames pushed to a panel, in milliseconds, idle
+   * and just after input. Injected because a test clock that never advances
+   * would otherwise treat every frame after the first as too soon.
+   * @default { idle: FRAME_MIN_INTERVAL_MS, interactive: INTERACTIVE_FRAME_INTERVAL_MS }
+   */
+  frameIntervalMs?: { idle?: number; interactive?: number }
+  /**
+   * Builds one sink's frame relay. Replaced by tests, which cannot negotiate a
+   * real peer connection; the production value is {@link RtcFrameRelay}.
+   * @default () => new RtcFrameRelay()
+   */
+  createRelay?: () => FrameRelay
   /** Clock for action traces. @default Date.now */
   now?: () => number
   /**
@@ -109,7 +166,14 @@ export interface BrowserViewServiceOptions {
    */
   authenticatedUrl?: (url: string) => string | undefined
   /** Browser factory, replaced by tests. */
-  openSession?: (options: { jpegQuality: number; viewport: { width: number; height: number }; onFrame: (frame: ScreencastFrame) => void; onTabsChanged: () => void }) => Promise<BrowserSession>
+  openSession?: (options: {
+    jpegQuality: number
+    frameFormat: FrameImageFormat
+    captureMax: { width: number; height: number }
+    viewport: { width: number; height: number }
+    onFrame: (frame: ScreencastFrame) => void
+    onTabsChanged: () => void
+  }) => Promise<BrowserSession>
 }
 
 /**
@@ -174,13 +238,33 @@ async function openDefaultSession(options: {
  */
 export class BrowserViewService implements BrowserViewBackend {
   private readonly jpegQuality: number
+  private readonly frameFormat: FrameImageFormat
+  private readonly captureMax: { width: number; height: number }
   private readonly viewport: { width: number; height: number }
+  private readonly idleFrameIntervalMs: number
+  private readonly interactiveFrameIntervalMs: number
   private readonly now: () => number
   private readonly openSession: NonNullable<BrowserViewServiceOptions['openSession']>
+  private readonly createRelay: () => FrameRelay
   private readonly authenticatedUrl: BrowserViewServiceOptions['authenticatedUrl']
   private readonly sinks = new Set<BrowserViewSink>()
   /** Per-sink WebRTC frame relay; a sink with an open relay receives frames there. */
-  private readonly relays = new Map<BrowserViewSink, RtcFrameRelay>()
+  private readonly relays = new Map<BrowserViewSink, FrameRelay>()
+  /**
+   * Panels that asked to stop the stream - their tab is not on screen (the
+   * sidebar is collapsed or another chip is showing). Nothing is captured,
+   * encoded or sent for them while they are in here.
+   */
+  private readonly paused = new Set<BrowserViewSink>()
+  /**
+   * When the last frame reached any panel, for the frame-interval budget.
+   * Starts at the beginning of time, not at zero: a clock whose origin is zero
+   * (a test clock, or a monotonic counter) would otherwise have its very first
+   * frame treated as too soon.
+   */
+  private lastFrameAt = Number.NEGATIVE_INFINITY
+  /** Until when input keeps the interactive frame rate. */
+  private interactiveUntil = 0
   private readonly bindings = new Map<string, string>()
   /**
    * Tabs whose one auth top-up for the current navigation is already spent.
@@ -212,8 +296,13 @@ export class BrowserViewService implements BrowserViewBackend {
    */
   constructor(options: BrowserViewServiceOptions = {}) {
     this.jpegQuality = options.jpegQuality ?? DEFAULT_JPEG_QUALITY
+    this.frameFormat = options.frameFormat ?? DEFAULT_FRAME_FORMAT
+    this.captureMax = options.captureMax ?? { width: DEFAULT_CAPTURE_MAX.width, height: DEFAULT_CAPTURE_MAX.height }
     this.viewport = options.viewport ?? { width: DEFAULT_VIEWPORT.width, height: DEFAULT_VIEWPORT.height }
+    this.idleFrameIntervalMs = options.frameIntervalMs?.idle ?? FRAME_MIN_INTERVAL_MS
+    this.interactiveFrameIntervalMs = options.frameIntervalMs?.interactive ?? INTERACTIVE_FRAME_INTERVAL_MS
     this.now = options.now ?? Date.now
+    this.createRelay = options.createRelay ?? (() => new RtcFrameRelay())
     this.openSession = options.openSession ?? openDefaultSession
     this.authenticatedUrl = options.authenticatedUrl
   }
@@ -247,9 +336,10 @@ export class BrowserViewService implements BrowserViewBackend {
     void this.startStreaming()
     return () => {
       this.sinks.delete(sink)
+      this.paused.delete(sink)
       this.relays.get(sink)?.dispose()
       this.relays.delete(sink)
-      if (this.sinks.size === 0) void this.stopStreaming()
+      if (this.activeSinks().length === 0) void this.stopStreaming()
     }
   }
 
@@ -299,14 +389,38 @@ export class BrowserViewService implements BrowserViewBackend {
           const tabs = await this.requireTabs()
           const tabId = this.displayedOrDefault()
           if (tabId === null) return
+          // Buying back frames for a moment: the person who just interacted is
+          // looking at this tab, so the bandwidth is worth spending here.
+          this.interactiveUntil = this.now() + INTERACTIVE_WINDOW_MS
           await tabs.dispatchInput(tabId, command.input)
+          return
+        }
+        case 'stream': {
+          // A panel whose tab left the screen says so; the host stops paying
+          // for a picture nobody sees. The last panel to leave stops the
+          // screencast itself, so an idle page costs no capture either.
+          const others = [...this.sinks].filter(candidate => candidate !== sink && !this.paused.has(candidate))
+          if (command.enabled) {
+            this.paused.delete(sink)
+            void this.startStreaming()
+            // Fresh picture immediately: the panel may have been paused for
+            // minutes and its last frame is stale.
+            const session = this.session
+            const tabId = this.displayedOrDefault()
+            if (session !== undefined && tabId !== null) {
+              await session.tabs.refreshFrame(tabId).catch(() => undefined)
+            }
+          } else {
+            this.paused.add(sink)
+            if (others.length === 0) await this.stopStreaming()
+          }
           return
         }
         case 'rtc-offer': {
           // One relay per panel socket; an existing one is replaced, so a
           // renegotiation simply starts over instead of leaking a connection.
           this.relays.get(sink)?.dispose()
-          const relay = new RtcFrameRelay()
+          const relay = this.createRelay()
           const answer = await relay.acceptOffer(command.sdp, () => {
             this.relays.get(sink) === relay && this.relays.delete(sink)
           })
@@ -760,15 +874,23 @@ export class BrowserViewService implements BrowserViewBackend {
 
   /** Push one event to every attached panel, dropping sockets that fail. */
   broadcast(event: BrowserViewEvent): void {
+    if (event.kind === 'frame' && !this.withinFrameBudget()) return
     for (const sink of [...this.sinks]) {
+      // A paused panel is not looking: it costs no bytes and no decoding.
+      if (event.kind === 'frame' && this.paused.has(sink)) continue
       try {
         // A sink with an open relay takes its frames there, as binary with no
         // base64 tax; everything else still travels the WebSocket.
         if (event.kind === 'frame') {
           const relay = this.relays.get(sink)
           if (relay !== undefined && relay.open) {
-            relay.sendFrame(event.seq, Buffer.from(event.data, 'base64'))
-            continue
+            if (relay.sendFrame(event.seq, Buffer.from(event.data, 'base64'))) continue
+            // A frame the channel cannot carry is a transport problem, never a
+            // panel problem: retire the relay and send this frame (and the
+            // following ones) over the WebSocket. Removing the sink here used
+            // to freeze the panel for good, because an oversized frame throws.
+            relay.dispose()
+            this.relays.delete(sink)
           }
         }
         sink.send(event)
@@ -776,6 +898,19 @@ export class BrowserViewService implements BrowserViewBackend {
         this.sinks.delete(sink)
       }
     }
+  }
+
+  /**
+   * Whether the frame-interval budget admits another frame right now: about
+   * 15 fps normally, about 30 fps for a moment after input.
+   * @returns true when a frame may go out.
+   */
+  private withinFrameBudget(): boolean {
+    const now = this.now()
+    const interval = now < this.interactiveUntil ? this.interactiveFrameIntervalMs : this.idleFrameIntervalMs
+    if (now - this.lastFrameAt < interval) return false
+    this.lastFrameAt = now
+    return true
   }
 
   /**
@@ -837,6 +972,8 @@ export class BrowserViewService implements BrowserViewBackend {
     try {
       const session = await this.openSession({
         jpegQuality: this.jpegQuality,
+        frameFormat: this.frameFormat,
+        captureMax: this.captureMax,
         viewport: this.viewport,
         onFrame: frame => { this.broadcast({ v: 1, kind: 'frame', ...frame }) },
         onTabsChanged: () => { this.broadcast({ v: 1, kind: 'state', state: this.state() }) },
@@ -853,9 +990,13 @@ export class BrowserViewService implements BrowserViewBackend {
   }
 
   /** Start the screencast for the tab the panel watches. */
+  private activeSinks(): BrowserViewSink[] {
+    return [...this.sinks].filter(sink => !this.paused.has(sink))
+  }
+
   private async startStreaming(): Promise<void> {
     const session = this.session
-    if (session === undefined || this.sinks.size === 0) return
+    if (session === undefined || this.activeSinks().length === 0) return
     const tabId = this.displayedOrDefault()
     if (tabId === null) return
     this.displayedTabId = tabId

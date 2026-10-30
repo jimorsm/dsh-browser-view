@@ -181,7 +181,9 @@ describe('screencast', () => {
     transport.emit('Page.screencastFrame', {
       data: 'FRAME-ONE',
       sessionId: 7,
-      metadata: { deviceWidth: 1280, deviceHeight: 800 },
+      // Metadata describing the window must be ignored: the frame is the
+      // capture box, and a panel told otherwise misplaces every click.
+      metadata: { deviceWidth: 999, deviceHeight: 999 },
     }, 'session-1')
     transport.emit('Page.screencastFrame', { data: 'FRAME-TWO', sessionId: 8 }, 'session-1')
 
@@ -192,8 +194,9 @@ describe('screencast', () => {
     expect(frames[0]).toEqual({
       tabId: 'tab-1',
       seq: 1,
-      width: 1280,
-      height: 800,
+      width: 1024,
+      height: 640,
+      format: 'webp',
       data: 'FRAME-ONE',
     })
   })
@@ -356,13 +359,61 @@ describe('dispatchInput', () => {
   it('a press-relay press maps onto mousePressed with the left button and a click count', async () => {
     // Given a manager with one open tab
     const { manager, transport } = await openManager()
-    // When the panel relays a left press at viewport pixels (30, 40)
+    // When the panel relays a left press at frame pixels (30, 40)
     await manager.dispatchInput('tab-1', { kind: 'mouse', action: 'down', x: 30, y: 40, button: 'left' })
-    // Then the transport saw one CDP mouse press carrying the unchanged point
+    // Then the transport saw one CDP mouse press, scaled from the capture box
+    // (1024x640 by default) onto the 1280x800 viewport the browser really has
     const press = transport.calls.find(call => call.method === 'Input.dispatchMouseEvent')
     expect(press).toBeDefined()
-    expect(press?.params).toMatchObject({ type: 'mousePressed', x: 30, y: 40, button: 'left', buttons: 1, clickCount: 1 })
+    expect(press?.params).toMatchObject({
+      type: 'mousePressed',
+      x: 37.5,
+      y: 50,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+    })
     expect(press?.sessionId).toBe('session-1')
+  })
+
+  it('an unscaled capture box relays the pointer unchanged', async () => {
+    // Given a manager whose capture box is exactly the viewport
+    const transport = new FakeTransport()
+    transport.responses.set('Target.createTarget', { targetId: 'tab-1' })
+    transport.responses.set('Target.attachToTarget', { sessionId: 'session-1' })
+    const manager = new TabManager({
+      transport,
+      viewport: { width: 1024, height: 640 },
+      captureMax: { width: 1024, height: 640 },
+      now: () => 1_000,
+    })
+    await manager.createTab()
+    // When the panel relays a press
+    await manager.dispatchInput('tab-1', { kind: 'mouse', action: 'down', x: 30, y: 40, button: 'left' })
+    // Then no scaling is applied
+    const press = transport.calls.find(call => call.method === 'Input.dispatchMouseEvent')
+    expect(press?.params).toMatchObject({ x: 30, y: 40 })
+  })
+
+  it('the capture box scales the frame and the screenshot request', async () => {
+    // Given a 1280x800 viewport and the default 1024x640 capture box
+    const { manager, transport } = await openManager()
+    // When a screencast starts and an on-demand frame is captured
+    await manager.startScreencast('tab-1')
+    const frame = await manager.refreshFrame('tab-1')
+    // Then CDP is asked for the smaller picture, and the frame reports it
+    expect(transport.callsOf('Page.startScreencast')[0]?.params).toMatchObject({
+      format: 'webp',
+      maxWidth: 1024,
+      maxHeight: 640,
+    })
+    expect(transport.callsOf('Page.captureScreenshot')[0]?.params).toMatchObject({
+      format: 'webp',
+      quality: 50,
+      clip: { x: 0, y: 0, width: 1280, height: 800, scale: 0.8 },
+    })
+    expect(frame.width).toBe(1024)
+    expect(frame.height).toBe(640)
   })
 
   it('a move carries no button state and a wheel keeps its deltas', async () => {

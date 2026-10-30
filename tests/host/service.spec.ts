@@ -454,3 +454,108 @@ describe('dispose', () => {
     expect(events).toHaveLength(seen)
   })
 })
+describe('stream budget and idle panels', () => {
+  it('a panel that reports itself hidden stops receiving frames while another keeps them', async () => {
+    // Given two panels watching one tab
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    const bob = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    browser.service.attach(bob.sink)
+    alice.events.length = 0
+    bob.events.length = 0
+    // When one of them says its tab left the screen
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'stream', enabled: false })
+    await browser.service.handleCommand(bob.sink, { v: 1, kind: 'request-frame' })
+    // Then only the watching panel pays for the picture
+    expect(alice.events.filter(event => event.kind === 'frame')).toHaveLength(0)
+    expect(bob.events.filter(event => event.kind === 'frame')).toHaveLength(1)
+  })
+
+  it('the last hidden panel stops the screencast itself', async () => {
+    // Given one panel watching one tab with a running screencast
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(browser.transport.callsOf('Page.startScreencast')).toHaveLength(1)
+    browser.transport.calls.length = 0
+    // When it reports itself hidden
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'stream', enabled: false })
+    // Then the host stops capturing entirely, so an idle page costs nothing
+    expect(browser.transport.callsOf('Page.stopScreencast')).toHaveLength(1)
+  })
+
+  it('a panel that comes back gets the screencast and one fresh frame', async () => {
+    // Given a hidden panel
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'stream', enabled: false })
+    browser.transport.calls.length = 0
+    alice.events.length = 0
+    // When it becomes visible again
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'stream', enabled: true })
+    // Then the screencast restarts and a fresh frame replaces the stale picture
+    expect(browser.transport.callsOf('Page.startScreencast')).toHaveLength(1)
+    expect(alice.events.filter(event => event.kind === 'frame')).toHaveLength(1)
+  })
+
+  it('frames are budgeted while idle and loosened for a moment after input', async () => {
+    // Given a panel watching a tab and a clock the test controls
+    let clock = 1_000
+    const browser = createFakeBrowser({ now: () => clock, frameIntervalMs: { idle: 66, interactive: 33 } })
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    alice.events.length = 0
+    const frames = () => alice.events.filter(event => event.kind === 'frame').length
+    // When frames are asked for 100 ms, then 10 ms, then 70 ms apart
+    clock = 1_100
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'request-frame' })
+    expect(frames()).toBe(1)
+    clock = 1_110
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'request-frame' })
+    clock = 1_180
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'request-frame' })
+    // Then the idle budget (66 ms) dropped exactly the frame that came too soon
+    expect(frames()).toBe(2)
+    // When the person interacts and another frame follows 40 ms later
+    await browser.service.handleCommand(alice.sink, {
+      v: 1,
+      kind: 'input',
+      input: { kind: 'wheel', x: 10, y: 10, deltaX: 0, deltaY: 100 },
+    })
+    expect(frames()).toBe(2)
+    clock = 1_220
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'request-frame' })
+    // Then input bought the interactive rate back: 40 ms is now soon enough
+    expect(frames()).toBe(3)
+  })
+
+  it('a relay that cannot send falls back to the socket instead of dropping the panel', async () => {
+    // Given a panel whose relay reports itself open but fails every send -
+    // which is what an oversized frame used to do, freezing the panel for good
+    const browser = createFakeBrowser({
+      createRelay: () => ({
+        open: true,
+        async acceptOffer() { return '{"type":"answer","sdp":"v=0"}' },
+        sendFrame: () => false,
+        dispose: () => undefined,
+      }),
+    })
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'rtc-offer', sdp: '{"type":"offer","sdp":"v=0"}' })
+    alice.events.length = 0
+    // When two frames are pushed
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'request-frame' })
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'request-frame' })
+    // Then both arrive over the socket and the panel is still attached
+    expect(alice.events.filter(event => event.kind === 'frame')).toHaveLength(2)
+  })
+})

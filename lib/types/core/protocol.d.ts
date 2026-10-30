@@ -25,11 +25,28 @@ export declare const BROWSER_VIEW_API_VERSION = 1;
 /** Mount path of the panel socket, relative to the GUI origin. */
 export declare const BROWSER_VIEW_SOCKET_PATH = "/api/dsh-browser-view/socket";
 /** JPEG quality the host asks CDP for; the panel only displays frames. */
-export declare const DEFAULT_JPEG_QUALITY = 70;
+export declare const DEFAULT_JPEG_QUALITY = 50;
 /** Viewport the host pins on every tab it creates, in CSS pixels. */
 export declare const DEFAULT_VIEWPORT: {
     readonly width: 1280;
     readonly height: 800;
+};
+/**
+ * Image format the host asks CDP for. WebP carries the same visual quality in
+ * roughly a third fewer bytes than JPEG, which is the difference between a
+ * heavy page costing 36 Mbps and costing under 10.
+ */
+export type FrameImageFormat = 'jpeg' | 'webp';
+/** Format used when the caller does not pick one. */
+export declare const DEFAULT_FRAME_FORMAT: FrameImageFormat;
+/**
+ * Box the captured frame is fitted into. The browser viewport stays at its own
+ * size (the agent's snapshots and coordinates are viewport-relative); only the
+ * picture travelling to the panel is scaled down, and input is scaled back up.
+ */
+export declare const DEFAULT_CAPTURE_MAX: {
+    readonly width: 1024;
+    readonly height: 640;
 };
 /** How long a tab may live without any session binding before it is reaped. */
 export declare const IDLE_TAB_TTL_MS: number;
@@ -86,11 +103,17 @@ export type BrowserViewEvent = {
     tabId: string;
     /** Monotonic frame counter, so a slow panel can drop intermediate frames. */
     seq: number;
-    /** Frame size in CSS pixels. */
+    /**
+     * Captured frame size in CSS pixels. Smaller than the viewport when the
+     * capture box scales the picture down; the panel maps its pointer back
+     * onto this box and the host scales up to viewport coordinates.
+     */
     width: number;
-    /** Frame size in CSS pixels. */
+    /** Captured frame size in CSS pixels. */
     height: number;
-    /** Base64 JPEG, no data: prefix. */
+    /** Encoding of `data`, so the panel labels the data URL correctly. */
+    format: FrameImageFormat;
+    /** Base64 image bytes, no data: prefix. */
     data: string;
 } | {
     v: 1;
@@ -130,6 +153,10 @@ export type BrowserViewCommand = {
     v: 1;
     kind: 'rtc-offer';
     sdp: string;
+} | {
+    v: 1;
+    kind: 'stream';
+    enabled: boolean;
 };
 /** One user input gesture the panel relays into the watched tab. */
 export type BrowserInputEvent = {

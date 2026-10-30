@@ -26,6 +26,24 @@ import { RTCPeerConnection } from 'werift'
 const GATHER_TIMEOUT_MS = 3_000
 
 /**
+ * Header in front of every chunk: a big-endian u32 sequence, the chunk index,
+ * and the chunk count. Mirrored by DC_HEADER_BYTES in the panel.
+ */
+const CHUNK_HEADER_BYTES = 6
+
+/**
+ * Payload per chunk. A DataChannel message is capped (werift enforces 64 KiB
+ * and the browser side caps at the same figure), and a frame routinely exceeds
+ * that: a 1280x800 page at quality 50 runs to a few hundred kilobytes, where
+ * the same page on JPEG/quality 70 measured 111 KB and a heavy page 250 KB.
+ * Chunking keeps one oversized frame from being unsendable.
+ */
+const CHUNK_PAYLOAD_BYTES = 60 * 1024
+
+/** A frame needing more chunks than the count byte can express is not sent. */
+const MAX_CHUNKS = 255
+
+/**
  * One panel's frame relay. Created per accepted `rtc-offer`; the service keeps
  * it next to the panel's sink and feeds frames through it while it is open.
  */
@@ -81,15 +99,26 @@ export class RtcFrameRelay {
   }
 
   /**
-   * Push one decoded frame over the channel.
+   * Push one decoded frame over the channel, in chunks small enough for the
+   * DataChannel message cap.
+   *
+   * Returns false instead of throwing when the frame cannot travel: an
+   * oversized frame or a channel that died mid-frame must cost one frame, not
+   * the panel. The caller falls back to the WebSocket for that frame.
    * @param seq - the frame's sequence number.
-   * @param jpeg - the raw JPEG bytes.
+   * @param jpeg - the raw image bytes.
+   * @returns whether the whole frame was handed to the channel.
    */
-  sendFrame(seq: number, jpeg: Buffer): void {
-    if (!this.open || this.channel === undefined) return
-    const head = Buffer.alloc(4)
-    head.writeUInt32BE(seq >>> 0)
-    this.channel.send(Buffer.concat([head, jpeg]))
+  sendFrame(seq: number, jpeg: Buffer): boolean {
+    if (!this.open || this.channel === undefined) return false
+    const chunks = chunkFrame(seq, jpeg)
+    if (chunks === null) return false
+    try {
+      for (const chunk of chunks) this.channel.send(chunk)
+      return true
+    } catch {
+      return false
+    }
   }
 
   /** Tear the peer connection down; safe to call more than once. */
@@ -103,4 +132,32 @@ export class RtcFrameRelay {
     this.pc = undefined
     this.channel = undefined
   }
+}
+
+/**
+ * Split one frame into DataChannel-sized messages.
+ *
+ * Pure so the framing can be tested without a peer connection, and so the
+ * panel's reassembler has a single counterpart to agree with. Every chunk
+ * carries the frame's sequence number, its own index and the total count, which
+ * is what lets the panel notice a chunk from a newer frame and abandon the
+ * partial one it was holding.
+ * @param seq - the frame's sequence number.
+ * @param bytes - the encoded frame.
+ * @param payloadBytes - payload per chunk; the default leaves room for the header under the 64 KiB cap.
+ * @returns the chunks in order, or null when the frame cannot be expressed.
+ */
+export function chunkFrame(seq: number, bytes: Buffer, payloadBytes: number = CHUNK_PAYLOAD_BYTES): Buffer[] | null {
+  const count = Math.max(1, Math.ceil(bytes.length / payloadBytes))
+  if (count > MAX_CHUNKS) return null
+  const head = Buffer.alloc(CHUNK_HEADER_BYTES)
+  head.writeUInt32BE(seq >>> 0, 0)
+  head.writeUInt8(count, 5)
+  const chunks: Buffer[] = []
+  for (let index = 0; index < count; index += 1) {
+    head.writeUInt8(index, 4)
+    const start = index * payloadBytes
+    chunks.push(Buffer.concat([head, bytes.subarray(start, start + payloadBytes)]))
+  }
+  return chunks
 }
