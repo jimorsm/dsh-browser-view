@@ -1,0 +1,56 @@
+# pnpm 11 reads settings here, not from package.json.
+
+# SDK peers are not auto-installed: the DSH host resolves them from the user's
+# profile tree at runtime, exactly as upstream does.
+autoInstallPeers: false
+
+# The @deepseek-ai SDK packages arrive with transitive native build scripts this
+# plugin never runs. Each carries an explicit false so a fresh install is
+# deterministic and quiet; revisit when the SDK cohort changes.
+allowBuilds:
+  '@deepseek-ai/dsh-subprocess-local': false
+  '@google/genai': false
+  koffi: false
+  node-pty: false
+  protobufjs: false
+
+# Upstream packaging defect, inherited from the dsh-web monorepo (which carries
+# the same packageExtensions block, reported at 0.1.5-alpha.2 and re-verified
+# against the 0.2.1-rc.3 tarballs): the published SDK packages import runtime
+# dependencies their published manifests never declare, so vitest/node
+# resolution fails for consumers that build from the registry alone. The host
+# web bundle supplies its own copies at runtime; these entries restore the graph
+# for the local build and test run. No installed file is patched. Remove an
+# entry once the SDK declares the dependency itself.
+packageExtensions:
+  '@deepseek-ai/dsh-client-store@0.2.1-rc.3':
+    dependencies:
+      zustand: '~4.4.7'
+      immer: '^10.1.1'
+  '@deepseek-ai/dsh-client-ui-primitives@0.2.1-rc.3':
+    dependencies:
+      # The emitted lib/index.js imports the client store (a platform module the
+      # host serves at runtime), and the published manifest omits it too. The
+      # upstream monorepo only ever resolved it by virtual-store hoisting; an
+      # explicit edge makes it resolvable from a registry-only install.
+      '@deepseek-ai/dsh-client-store': '0.2.1-rc.3'
+      anser: '^2.3.5'
+      clsx: '^2.0.0'
+      diff: '^9.0.0'
+      katex: '^0.16.47'
+      shiki: '^4.3.1'
+      '@shikijs/langs': '^4.3.1'
+      mdast-util-from-markdown: '^2.0.3'
+      mdast-util-gfm: '^3.1.0'
+      mdast-util-math: '^3.0.0'
+      micromark-core-commonmark: '^2.0.3'
+      micromark-extension-gfm: '^3.0.0'
+      micromark-extension-math: '^3.1.0'
+      micromark-factory-space: '^2.0.1'
+      micromark-util-character: '^2.1.1'
+      micromark-util-classify-character: '^2.0.1'
+      micromark-util-sanitize-uri: '^2.0.1'
+      micromark-util-symbol: '^2.0.1'
+      '@deepseek-ai/dsh-util-workspace-path': '0.2.1-rc.3'
+      '@deepseek-ai/dsh-util-code-language': '0.2.1-rc.3'
+      simple-icons: '16.31.0'

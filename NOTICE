@@ -1,0 +1,33 @@
+dsh-browser-view
+Copyright 2026 the dsh-browser-view contributors
+
+This repository is a community fork of the `packages/dsh-browser-view` plugin
+from the dsh-web project:
+
+    upstream: https://github.com/zhu1090093659/dsh-web
+    upstream path: packages/dsh-browser-view
+    upstream package name: @linxin666/dsh-client-ui-browser-view
+    forked from: version 0.4.10 (dev branch), plus the fork's own feature work
+
+Copyright in the upstream portions remains with the upstream authors. The fork
+is maintained under the scope `@jimorsm/` and is not affiliated with, endorsed
+by, or published by the dsh-web project; it does not use the upstream npm scope
+and is not published to npm by the upstream release pipeline.
+
+Licensing, stated plainly because the upstream sources do not agree with each
+other: the upstream repository ships an Apache-2.0 LICENSE at its root (copied
+here verbatim as LICENSE), while the upstream package manifest declares
+"license": "BSD-3-Clause". This fork keeps the package-level BSD-3-Clause
+declaration so the terms the package was distributed under are preserved, and
+carries the upstream Apache-2.0 repository license alongside it. If you need a
+single authoritative answer for a downstream redistribution question, ask the
+upstream maintainers.
+
+Bundled third-party sources:
+
+  - `build/tsdown.client.ts` and `build/web-platform.ts` are vendored verbatim
+    from the upstream dsh-web repository's `shared/` directory, so this
+    repository builds without a checkout of that monorepo.
+
+Runtime dependencies of the plugin (werift, ws) keep their own licenses; see
+their packages for the terms.
