@@ -73,10 +73,11 @@ agent 工具调用 ──► 宿主半区 ──► CDP ──► 专用 Chromiu
 本仓是自包含 bundle，可直接从 GitHub 安装：
 
 ```sh
-dsh plugin --profile web add git:https://github.com/jimorsm/dsh-browser-view
+dsh plugin --profile web add git+https://github.com/jimorsm/dsh-browser-view
 ```
 
-本地开发时改为链接检出目录：
+`lib/` 随仓库提交，安装期不跑任何构建脚本、无需 `allowBuilds` 放行；要冻结到某个
+提交或 tag 就加 `#<ref>`。本地开发时改为克隆后链接检出目录：
 
 ```sh
 dsh plugin --profile web add link:<本地检出目录>

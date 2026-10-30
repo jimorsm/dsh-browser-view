@@ -21,3 +21,6 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
+      # lib/ is committed so a git install needs no build script; a stale
+      # artifact would ship code that no longer matches src/.
+      - run: git diff --exit-code -- lib

@@ -73,10 +73,12 @@ The single-occupant `rightbar` / `rightbar.session` seats are still not touched:
 This repository is a standalone bundle: install it straight from GitHub.
 
 ```sh
-dsh plugin --profile web add git:https://github.com/jimorsm/dsh-browser-view
+dsh plugin --profile web add git+https://github.com/jimorsm/dsh-browser-view
 ```
 
-For local development, link the checkout instead:
+`lib/` is committed, so the install runs no build script and needs no
+`allowBuilds` opt-in; pin a commit or tag with `#<ref>` if you want a frozen
+copy. To build locally instead, clone and link the checkout:
 
 ```sh
 dsh plugin --profile web add link:<this checkout>
