@@ -18,18 +18,20 @@
  * @module @jimorsm/dsh-client-ui-browser-view/core/tabs
  */
 import type { CdpTransport } from './cdp.ts';
-import { type BrowserConsoleEntry, type BrowserInputEvent, type BrowserNetworkEntry, type BrowserTabView } from './protocol.ts';
-/** One JPEG frame as the panel receives it. */
+import { type BrowserConsoleEntry, type BrowserInputEvent, type BrowserNetworkEntry, type BrowserTabView, type FrameImageFormat } from './protocol.ts';
+/** One captured frame as the panel receives it. */
 export interface ScreencastFrame {
     /** Tab the frame belongs to. */
     tabId: string;
     /** Monotonic per-tab frame counter. */
     seq: number;
-    /** Frame width in CSS pixels. */
+    /** Captured frame width in CSS pixels (the capture box, not the viewport). */
     width: number;
-    /** Frame height in CSS pixels. */
+    /** Captured frame height in CSS pixels. */
     height: number;
-    /** Base64 JPEG without the `data:` prefix. */
+    /** Encoding of `data`. */
+    format: FrameImageFormat;
+    /** Base64 image bytes without the `data:` prefix. */
     data: string;
 }
 /** Construction options. */
@@ -38,6 +40,13 @@ export interface TabManagerOptions {
     transport: CdpTransport;
     /** JPEG quality requested from CDP. @default DEFAULT_JPEG_QUALITY */
     jpegQuality?: number;
+    /** Frame encoding requested from CDP. @default DEFAULT_FRAME_FORMAT */
+    frameFormat?: FrameImageFormat;
+    /** Capture box the frame is fitted into. @default DEFAULT_CAPTURE_MAX */
+    captureMax?: {
+        width: number;
+        height: number;
+    };
     /** Viewport pinned on every new tab. @default DEFAULT_VIEWPORT */
     viewport?: {
         width: number;
@@ -88,6 +97,8 @@ export declare function pushBounded<T>(ring: T[], entry: T, limit: number): void
 export declare class TabManager {
     private readonly transport;
     private readonly jpegQuality;
+    private readonly frameFormat;
+    private readonly captureMax;
     private readonly viewport;
     private readonly ringSize;
     private readonly now;
@@ -185,10 +196,25 @@ export declare class TabManager {
      */
     refreshFrame(tabId: string): Promise<ScreencastFrame>;
     /**
+     * The size a captured frame actually has: the capture box, clipped to the
+     * viewport's aspect ratio so both encodings agree on the picture.
+     * @returns capture size in CSS pixels.
+     */
+    private captureSize;
+    /**
+     * Map a pointer position on the captured frame back onto the viewport.
+     * The panel scales its own display box onto the frame it was sent, so what
+     * arrives here is frame-relative; the browser needs viewport-relative.
+     * @param x - frame-relative x.
+     * @param y - frame-relative y.
+     * @returns viewport-relative coordinates.
+     */
+    private toViewport;
+    /**
      * Relay one panel input gesture into the tab over CDP.
      *
-     * The panel sends viewport CSS pixels it already scaled from its display
-     * size, so the coordinates go through unchanged. Modifier and button names
+     * The panel sends frame CSS pixels it already scaled from its display size,
+     * which this method maps back onto the viewport. Modifier and button names
      * map onto the CDP bit masks here, the contract stays human-readable.
      * @param tabId - target tab.
      * @param input - one validated gesture from the wire contract.

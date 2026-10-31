@@ -11,11 +11,13 @@ export interface BrowserViewFrame {
     readonly tabId: string;
     /** Host-side monotonic counter for this tab. */
     readonly seq: number;
-    /** Frame width in CSS pixels. */
+    /** Captured frame width in CSS pixels. */
     readonly width: number;
-    /** Frame height in CSS pixels. */
+    /** Captured frame height in CSS pixels. */
     readonly height: number;
-    /** Base64 JPEG, no data: prefix. */
+    /** Encoding of `data`; a host without the field always sent JPEG. */
+    readonly format?: 'jpeg' | 'webp';
+    /** Base64 image bytes, no data: prefix. */
     readonly data: string;
 }
 /** Callbacks the panel installs on a connection. */

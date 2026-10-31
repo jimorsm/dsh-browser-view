@@ -51,6 +51,7 @@ import {
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import type { BrowserActionTrace, BrowserInputEvent, BrowserPanelState } from '../core/protocol.ts'
 import { BROWSER_VIEW_API_VERSION } from '../core/protocol.ts'
+import { FrameAssembler, readFrameChunk } from './frame-assembly.ts'
 import type { BrowserViewLiveTitleStore } from './live-title.ts'
 import { BROWSER_VIEW_PARTS, BROWSER_VIEW_PLUGIN } from './semantic.ts'
 import {
@@ -115,7 +116,14 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
 
   useEffect(() => {
     const instance = factory({
-      onStatus: (next) => { setStatus(next) },
+      onStatus: (next) => {
+        setStatus(next)
+        // A reconnected host streams by default, so a panel that is off screen
+        // has to say so again on the new socket.
+        if (next === 'open' && !announcedRef.current) {
+          socketRef.current?.send({ v: BROWSER_VIEW_API_VERSION, kind: 'stream', enabled: false })
+        }
+      },
       onState: (next) => {
         // Compare outside the state updater: an updater must stay pure, and a
         // frame from the previous tab would otherwise stay on screen after the
@@ -128,6 +136,7 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
       },
       onFrame: (next) => {
         setError(null)
+        frameFormatRef.current = next.format ?? 'jpeg'
         setFrame(next)
       },
       onAction: (trace) => {
@@ -158,7 +167,9 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
   // One narrowed value for the stage: a frame is only paintable when the host
   // reported no error, which keeps the null check off the JSX branch.
   const visibleFrame = effectiveError === null ? frame : null
-  const dataUrl = visibleFrame === null ? null : `data:image/jpeg;base64,${visibleFrame.data}`
+  const dataUrl = visibleFrame === null
+    ? null
+    : `data:image/${visibleFrame.format ?? 'jpeg'};base64,${visibleFrame.data}`
   // --- Input relay -------------------------------------------------------
   // One wire frame per gesture; moves are throttled because a dragged pointer
   // fires far faster than the page can usefully consume.
@@ -177,6 +188,15 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const rtcTriedRef = useRef(false)
   const rtcAnswerRef = useRef<((sdp: string) => void) | undefined>(undefined)
+  /** Encoding of the last frame seen over the socket; the DataChannel path has
+   *  no per-message header field for it, so it inherits the stream's. */
+  const frameFormatRef = useRef<'jpeg' | 'webp'>('jpeg')
+  /** Panel root, observed to learn whether this tab is actually on screen. */
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  /** Whether this panel last told the host it is watching (the host's default). */
+  const announcedRef = useRef(true)
+  /** Reassembles chunked DataChannel frames. */
+  const assemblerRef = useRef(new FrameAssembler())
 
   const sendInput = (input: BrowserInputEvent): void => {
     socketRef.current?.send({ v: BROWSER_VIEW_API_VERSION, kind: 'input', input })
@@ -273,6 +293,59 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
     onKeyUp,
   }
 
+  // Tell the host when this tab is not on screen.
+  //
+  // The sidebar keeps the panel mounted while the column is collapsed or
+  // another chip is showing, so "mounted" is not "watching": without this an
+  // animating page keeps pushing frames nobody sees for as long as the panel
+  // lives. The host stops capturing, encoding and sending for a panel that
+  // reports itself hidden, and sends one fresh frame when it returns.
+  //
+  // The shell's hiding mechanism is not part of this plugin's contract, so the
+  // state is derived from three signals instead of one: intersection (covers
+  // display:none, zero size and off-screen), the document's own visibility
+  // (the whole GUI tab is hidden), and a slow poll that walks the ancestors for
+  // a computed display/visibility/content-visibility change - which is what
+  // covers a sidebar that hides the column with `visibility: hidden` and
+  // therefore keeps a layout box intersection would still call visible.
+  useEffect(() => {
+    const element = rootRef.current
+    // jsdom, the client test environment, has no IntersectionObserver and no
+    // layout; the browser always has both.
+    if (element === null || typeof IntersectionObserver === 'undefined') return
+    let intersecting = element.getClientRects().length > 0
+    const rendered = (): boolean => {
+      if (document.visibilityState !== 'visible') return false
+      if (!intersecting) return false
+      const box = element.getBoundingClientRect()
+      if (box.width < 2 || box.height < 2) return false
+      for (let node: Element | null = element; node !== null; node = node.parentElement) {
+        const style = getComputedStyle(node)
+        if (style.display === 'none' || style.visibility === 'hidden') return false
+        if (style.contentVisibility === 'hidden') return false
+      }
+      return true
+    }
+    const announce = (): void => {
+      const visible = rendered()
+      if (announcedRef.current === visible) return
+      announcedRef.current = visible
+      socketRef.current?.send({ v: BROWSER_VIEW_API_VERSION, kind: 'stream', enabled: visible })
+    }
+    const observer = new IntersectionObserver((entries) => {
+      intersecting = entries.some(entry => entry.isIntersecting)
+      announce()
+    })
+    observer.observe(element)
+    document.addEventListener('visibilitychange', announce)
+    const poll = window.setInterval(announce, 1_000)
+    return () => {
+      observer.disconnect()
+      document.removeEventListener('visibilitychange', announce)
+      window.clearInterval(poll)
+    }
+  }, [])
+
   // Offer the DataChannel once per socket session, after the first WS frame
   // shows the stream is alive. A five-second window covers ICE; past it the
   // connection is torn down and the WS stream simply continues. On reconnect
@@ -292,14 +365,24 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
       return
     }
     pcRef.current = pc
+    // A new peer connection starts a new stream: a partial frame from the old
+    // channel can never be completed and must not be mixed into this one.
+    assemblerRef.current.reset()
     const channel = pc.createDataChannel('frames', { ordered: false, maxRetransmits: 0 })
     channel.binaryType = 'arraybuffer'
     channel.onopen = () => { setDcActive(true) }
     channel.onclose = () => { setDcActive(false) }
+    // A frame larger than the DataChannel message cap arrives as several
+    // chunks (see host/rtc.ts): [u32 seq][u8 index][u8 count] then payload.
+    // The channel is unordered and unreliable by design, so chunks are
+    // accumulated per sequence and a chunk for a newer frame abandons the
+    // partial one - a late chunk can never complete a stale frame on screen.
     channel.onmessage = (event: MessageEvent) => {
-      const buffer = event.data as ArrayBuffer
-      if (buffer.byteLength < 5) return
-      const blob = new Blob([buffer.slice(4)], { type: 'image/jpeg' })
+      const chunk = readFrameChunk(event.data as ArrayBuffer)
+      if (chunk === null) return
+      const complete = assemblerRef.current.push(chunk)
+      if (complete === null) return
+      const blob = new Blob([complete], { type: `image/${frameFormatRef.current}` })
       void createImageBitmap(blob).then((bitmap) => {
         const canvas = canvasRef.current
         if (canvas !== null) {
@@ -357,7 +440,7 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
   }, [liveTitle, sessionId, pageTitle])
 
   return (
-    <div className={css.root} data-dsh-plugin={BROWSER_VIEW_PLUGIN} data-dsh-part={BROWSER_VIEW_PARTS.panel}>
+    <div ref={rootRef} className={css.root} data-dsh-plugin={BROWSER_VIEW_PLUGIN} data-dsh-part={BROWSER_VIEW_PARTS.panel}>
       <div className={css.toolbar} data-dsh-part={BROWSER_VIEW_PARTS.toolbar}>
         <div className={css.addressBox} data-dsh-part={BROWSER_VIEW_PARTS.address}>
           <input

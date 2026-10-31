@@ -39,11 +39,31 @@ export declare class RtcFrameRelay {
      */
     acceptOffer(offerSdpJson: string, onClosed: () => void): Promise<string>;
     /**
-     * Push one decoded frame over the channel.
+     * Push one decoded frame over the channel, in chunks small enough for the
+     * DataChannel message cap.
+     *
+     * Returns false instead of throwing when the frame cannot travel: an
+     * oversized frame or a channel that died mid-frame must cost one frame, not
+     * the panel. The caller falls back to the WebSocket for that frame.
      * @param seq - the frame's sequence number.
-     * @param jpeg - the raw JPEG bytes.
+     * @param jpeg - the raw image bytes.
+     * @returns whether the whole frame was handed to the channel.
      */
-    sendFrame(seq: number, jpeg: Buffer): void;
+    sendFrame(seq: number, jpeg: Buffer): boolean;
     /** Tear the peer connection down; safe to call more than once. */
     dispose(): void;
 }
+/**
+ * Split one frame into DataChannel-sized messages.
+ *
+ * Pure so the framing can be tested without a peer connection, and so the
+ * panel's reassembler has a single counterpart to agree with. Every chunk
+ * carries the frame's sequence number, its own index and the total count, which
+ * is what lets the panel notice a chunk from a newer frame and abandon the
+ * partial one it was holding.
+ * @param seq - the frame's sequence number.
+ * @param bytes - the encoded frame.
+ * @param payloadBytes - payload per chunk; the default leaves room for the header under the 64 KiB cap.
+ * @returns the chunks in order, or null when the frame cannot be expressed.
+ */
+export declare function chunkFrame(seq: number, bytes: Buffer, payloadBytes?: number): Buffer[] | null;

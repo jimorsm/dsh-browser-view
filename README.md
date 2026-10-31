@@ -30,9 +30,20 @@ agent tool call ──► host half ──► CDP ──► dedicated Chromium
 
 The host half starts Chrome lazily on the first tool call or the first tab mount, pins a viewport, and keeps a ring of console entries and network requests per tab so a verification can be read back without re-running the page. A top-level document replacement clears both rings; a same-document navigation (hash, query, SPA pushState) keeps them.
 
-## Frame transport
+## Frame transport and bandwidth
 
-Frames default to the WebSocket (JSON + base64). After mounting, the panel additionally performs a WebRTC handshake with the host: the panel creates an **unreliable, unordered** DataChannel (drops beat stalls, exactly what a frame stream wants) and the host answers with [werift](https://github.com/shinyoshiaki/werift-webrtc), a pure-TypeScript WebRTC implementation with zero native dependencies. Once the channel opens, binary frames travel there (4-byte sequence + raw JPEG); the control plane (state, actions, commands, input) stays on the WebSocket. Any failure falls back to the WebSocket stream transparently - nothing depends on the upgrade succeeding.
+Frames default to the WebSocket (JSON + base64). After mounting, the panel additionally performs a WebRTC handshake with the host: the panel creates an **unreliable, unordered** DataChannel (drops beat stalls, exactly what a frame stream wants) and the host answers with [werift](https://github.com/shinyoshiaki/werift-webrtc), a pure-TypeScript WebRTC implementation with zero native dependencies. Once the channel opens, binary frames travel there; the control plane (state, actions, commands, input) stays on the WebSocket. Every failure - including a single frame the channel cannot send - falls back to the WebSocket, and costs **that frame only**: the panel is never dropped from the broadcast.
+
+One frame is split into chunks of at most 60 KiB, each prefixed with `[u32 sequence][u8 index][u8 count]`, and the panel rebuilds it before decoding. This is not optional: a DataChannel message is capped at 64 KiB, while real pages routinely exceed it (measured at 1280x800 and quality 70: 111 KB for a Wikipedia article, 250 KB for a heavy DOM page), so an unchunked frame throws every single time.
+
+Bandwidth is designed for "look when you need to, step in when you must", not for watching video:
+
+| Measure | Effect |
+| --- | --- |
+| Frame encoding | WebP at quality 50 (was JPEG at 70), visibly the same at a clearly smaller size |
+| Capture box | Captured at 1024x640 (the browser viewport stays 1280x800); pointer coordinates are scaled back up, so clicking stays exact |
+| Frame budget | At most about 15 fps while nobody interacts, opened to about 30 fps for three seconds after any input |
+| Invisible means stopped | A collapsed sidebar, another chip in front, or a hidden browser tab tells the host; the **last** watching panel leaving stops the screencast outright - nothing is captured, encoded or sent - and returning restores it with one fresh frame |
 
 ## Interface seats
 

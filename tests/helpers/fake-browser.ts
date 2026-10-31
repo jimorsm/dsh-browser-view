@@ -9,7 +9,7 @@
  * @module tests/helpers/fake-browser
  */
 
-import { BrowserViewService, type BrowserSession } from '../../src/host/service.ts'
+import { BrowserViewService, type BrowserSession, type FrameRelay } from '../../src/host/service.ts'
 import { TabManager } from '../../src/core/tabs.ts'
 import { FakeTransport } from './fake-cdp.ts'
 
@@ -35,7 +35,14 @@ export interface FakeBrowser {
  * @param options - fail the launch, or override the clock.
  * @returns the service plus its test hooks.
  */
-export function createFakeBrowser(options: { failLaunch?: () => Error | undefined; now?: () => number } = {}): FakeBrowser {
+export function createFakeBrowser(options: {
+  failLaunch?: () => Error | undefined
+  now?: () => number
+  /** Re-enable the frame-interval budget when the budget itself is under test. */
+  frameIntervalMs?: { idle?: number; interactive?: number }
+  /** Replace the WebRTC relay, which needs a real peer connection otherwise. */
+  createRelay?: () => FrameRelay
+} = {}): FakeBrowser {
   const transport = new FakeTransport()
   let tabCounter = 0
   let opens = 0
@@ -62,6 +69,12 @@ export function createFakeBrowser(options: { failLaunch?: () => Error | undefine
 
   const service = new BrowserViewService({
     now: options.now ?? (() => 500),
+    // The default clock here never advances, so the frame-interval budget would
+    // suppress every frame after the first. Tests about anything else turn it
+    // off; the budget itself is covered in service.spec.ts with a moving clock
+    // and by the real defaults.
+    frameIntervalMs: options.frameIntervalMs ?? { idle: 0, interactive: 0 },
+    ...(options.createRelay === undefined ? {} : { createRelay: options.createRelay }),
     openSession: async (opts): Promise<BrowserSession> => {
       opens += 1
       const failure = options.failLaunch?.()

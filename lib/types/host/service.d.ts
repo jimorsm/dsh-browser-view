@@ -23,7 +23,7 @@ import type { CdpTransport } from '../core/cdp.ts';
 import { ChromeProcess } from '../core/chrome.ts';
 import { TabManager, type ScreencastFrame } from '../core/tabs.ts';
 import { type ActionOutcome, type ElementTarget } from '../core/actions.ts';
-import { type BrowserConsoleEntry, type BrowserNetworkEntry, type BrowserPanelState, type BrowserSnapshot, type BrowserTabView, type BrowserViewCommand, type BrowserViewEvent } from '../core/protocol.ts';
+import { type FrameImageFormat, type BrowserConsoleEntry, type BrowserNetworkEntry, type BrowserPanelState, type BrowserSnapshot, type BrowserTabView, type BrowserViewCommand, type BrowserViewEvent } from '../core/protocol.ts';
 /** One attached panel socket as the service sees it. */
 export interface BrowserViewSink {
     /** Deliver one event; a throw means the sink is gone. */
@@ -65,6 +65,25 @@ export interface BrowserSession {
     /** Stop everything this session owns. */
     dispose(): Promise<void>;
 }
+/** What the service needs from one sink's frame relay. */
+export interface FrameRelay {
+    /** Whether the channel is open and frames may travel over it. */
+    readonly open: boolean;
+    /**
+     * Accept a panel's offer.
+     * @param offerSdpJson - the panel's description as JSON.
+     * @param onClosed - called when the connection dies.
+     * @returns the answer description as JSON.
+     */
+    acceptOffer(offerSdpJson: string, onClosed: () => void): Promise<string>;
+    /**
+     * Hand one frame to the channel.
+     * @returns whether the whole frame travelled.
+     */
+    sendFrame(seq: number, image: Buffer): boolean;
+    /** Release the connection. */
+    dispose(): void;
+}
 /** Construction options. */
 export interface BrowserViewServiceOptions {
     /** JPEG quality for frames and screenshots. @default DEFAULT_JPEG_QUALITY */
@@ -74,6 +93,29 @@ export interface BrowserViewServiceOptions {
         width: number;
         height: number;
     };
+    /** Frame encoding requested from CDP. @default DEFAULT_FRAME_FORMAT */
+    frameFormat?: FrameImageFormat;
+    /** Capture box the frame is fitted into. @default DEFAULT_CAPTURE_MAX */
+    captureMax?: {
+        width: number;
+        height: number;
+    };
+    /**
+     * Smallest gap between two frames pushed to a panel, in milliseconds, idle
+     * and just after input. Injected because a test clock that never advances
+     * would otherwise treat every frame after the first as too soon.
+     * @default { idle: FRAME_MIN_INTERVAL_MS, interactive: INTERACTIVE_FRAME_INTERVAL_MS }
+     */
+    frameIntervalMs?: {
+        idle?: number;
+        interactive?: number;
+    };
+    /**
+     * Builds one sink's frame relay. Replaced by tests, which cannot negotiate a
+     * real peer connection; the production value is {@link RtcFrameRelay}.
+     * @default () => new RtcFrameRelay()
+     */
+    createRelay?: () => FrameRelay;
     /** Clock for action traces. @default Date.now */
     now?: () => number;
     /**
@@ -85,6 +127,11 @@ export interface BrowserViewServiceOptions {
     /** Browser factory, replaced by tests. */
     openSession?: (options: {
         jpegQuality: number;
+        frameFormat: FrameImageFormat;
+        captureMax: {
+            width: number;
+            height: number;
+        };
         viewport: {
             width: number;
             height: number;
@@ -109,13 +156,33 @@ export declare function closeSessionTargets(session: Pick<BrowserSession, 'trans
  */
 export declare class BrowserViewService implements BrowserViewBackend {
     private readonly jpegQuality;
+    private readonly frameFormat;
+    private readonly captureMax;
     private readonly viewport;
+    private readonly idleFrameIntervalMs;
+    private readonly interactiveFrameIntervalMs;
     private readonly now;
     private readonly openSession;
+    private readonly createRelay;
     private readonly authenticatedUrl;
     private readonly sinks;
     /** Per-sink WebRTC frame relay; a sink with an open relay receives frames there. */
     private readonly relays;
+    /**
+     * Panels that asked to stop the stream - their tab is not on screen (the
+     * sidebar is collapsed or another chip is showing). Nothing is captured,
+     * encoded or sent for them while they are in here.
+     */
+    private readonly paused;
+    /**
+     * When the last frame reached any panel, for the frame-interval budget.
+     * Starts at the beginning of time, not at zero: a clock whose origin is zero
+     * (a test clock, or a monotonic counter) would otherwise have its very first
+     * frame treated as too soon.
+     */
+    private lastFrameAt;
+    /** Until when input keeps the interactive frame rate. */
+    private interactiveUntil;
     private readonly bindings;
     /**
      * Tabs whose one auth top-up for the current navigation is already spent.
@@ -371,6 +438,12 @@ export declare class BrowserViewService implements BrowserViewBackend {
     /** Push one event to every attached panel, dropping sockets that fail. */
     broadcast(event: BrowserViewEvent): void;
     /**
+     * Whether the frame-interval budget admits another frame right now: about
+     * 15 fps normally, about 30 fps for a moment after input.
+     * @returns true when a frame may go out.
+     */
+    private withinFrameBudget;
+    /**
      * Tear everything down: stop pushing, stop streaming, close the socket, kill
      * the browser.
      * @returns once every owned resource is released.
@@ -387,6 +460,7 @@ export declare class BrowserViewService implements BrowserViewBackend {
     /** Start the browser once, recording failures for the panel. */
     private startSession;
     /** Start the screencast for the tab the panel watches. */
+    private activeSinks;
     private startStreaming;
     /** Stop streaming when nobody is watching. */
     private stopStreaming;

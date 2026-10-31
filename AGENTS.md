@@ -19,6 +19,18 @@ to this package; the upstream dsh-web monorepo rules do not apply here.
 - 面板是右栏标签页，不是浮层也不是中央页面：不要引入 `position: fixed`、自管显隐或
   `main` / `sidebar.panellist` 注册；`keepMounted` 必须保持开启，切 chip 不能断 socket。
 - 面板承载的是**帧**，不是 iframe。
+- 帧预算与暂停：`service.withinFrameBudget` 限制帧间隔（空闲 66ms ≈15fps，任一 `input`
+  后 3 秒内 33ms ≈30fps）；面板不可见时发 `stream{enabled:false}`，宿主把该 sink 移入
+  `paused`（不广播），最后一个可见 sink 离开即 `stopScreencast`，恢复时补一帧。改动
+  这两个阈值或暂停语义时，`tests/host/service.spec.ts` 的「stream budget and idle panels」
+  是契约面。测试用固定时钟必须注入 `frameIntervalMs`，否则第一帧之后全被预算吞掉。
+- 帧编码与采集盒：默认 WebP + 质量 50，采集 1024×640（视口仍 1280×800）；
+  `TabManager.toViewport` 负责把面板来的帧坐标放大回视口坐标——**改采集盒必须同时保有
+  这个换算**，否则点击会整体偏移。
+- 帧分块：`chunkFrame`（`src/host/rtc.ts`）与 `FrameAssembler`（`src/client/frame-assembly.ts`）
+  是同一份 `[u32 seq][u8 idx][u8 count]` 契约的两半，`tests/host/rtc.spec.ts` 用两者互相验证。
+  DataChannel 单条消息上限 64 KiB，超过单块上限的帧必须分块；`sendFrame` 返回 false 时
+  `broadcast` 只降级该帧到 WS 并 dispose 该 relay，**绝不删除 sink**（删 sink 会让面板永久冻结）。
 - 帧传输双路：WS（JSON+base64）是保底，面板发起 WebRTC DataChannel（不可靠不保序）
   提升后走二进制帧（4 字节 seq + JPEG）；host 侧实现在 `src/host/rtc.ts`（werift，
   零原生依赖），service 按 sink 过滤 frame 事件，relay 打开即不走 WS。控制面永远在

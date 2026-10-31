@@ -20,6 +20,8 @@
 
 import type { CdpTransport } from './cdp.ts'
 import {
+  DEFAULT_CAPTURE_MAX,
+  DEFAULT_FRAME_FORMAT,
   DEFAULT_JPEG_QUALITY,
   DEFAULT_VIEWPORT,
   EVENT_RING_SIZE,
@@ -27,19 +29,22 @@ import {
   type BrowserInputEvent,
   type BrowserNetworkEntry,
   type BrowserTabView,
+  type FrameImageFormat,
 } from './protocol.ts'
 
-/** One JPEG frame as the panel receives it. */
+/** One captured frame as the panel receives it. */
 export interface ScreencastFrame {
   /** Tab the frame belongs to. */
   tabId: string
   /** Monotonic per-tab frame counter. */
   seq: number
-  /** Frame width in CSS pixels. */
+  /** Captured frame width in CSS pixels (the capture box, not the viewport). */
   width: number
-  /** Frame height in CSS pixels. */
+  /** Captured frame height in CSS pixels. */
   height: number
-  /** Base64 JPEG without the `data:` prefix. */
+  /** Encoding of `data`. */
+  format: FrameImageFormat
+  /** Base64 image bytes without the `data:` prefix. */
   data: string
 }
 
@@ -49,6 +54,10 @@ export interface TabManagerOptions {
   transport: CdpTransport
   /** JPEG quality requested from CDP. @default DEFAULT_JPEG_QUALITY */
   jpegQuality?: number
+  /** Frame encoding requested from CDP. @default DEFAULT_FRAME_FORMAT */
+  frameFormat?: FrameImageFormat
+  /** Capture box the frame is fitted into. @default DEFAULT_CAPTURE_MAX */
+  captureMax?: { width: number; height: number }
   /** Viewport pinned on every new tab. @default DEFAULT_VIEWPORT */
   viewport?: { width: number; height: number }
   /** Console and network ring size. @default EVENT_RING_SIZE */
@@ -85,11 +94,16 @@ interface TabRecord {
   refs: Map<number, string>
 }
 
-/** Params of one `Page.screencastFrame` event. */
+/**
+ * Params of one `Page.screencastFrame` event.
+ *
+ * `metadata.deviceWidth`/`deviceHeight` are deliberately absent: they describe
+ * the browser window, not the captured picture, and using them as the frame's
+ * size is what put every click 1.25x off once a capture box was in play.
+ */
 interface ScreencastFrameParams {
   data?: unknown
   sessionId?: unknown
-  metadata?: { deviceWidth?: unknown; deviceHeight?: unknown }
 }
 
 /** Params of one `Runtime.consoleAPICalled` event. */
@@ -161,6 +175,8 @@ function describeConsoleArg(arg: { value?: unknown; description?: unknown; unser
 export class TabManager {
   private readonly transport: CdpTransport
   private readonly jpegQuality: number
+  private readonly frameFormat: FrameImageFormat
+  private readonly captureMax: { width: number; height: number }
   private readonly viewport: { width: number; height: number }
   private readonly ringSize: number
   private readonly now: () => number
@@ -178,6 +194,8 @@ export class TabManager {
   constructor(options: TabManagerOptions) {
     this.transport = options.transport
     this.jpegQuality = options.jpegQuality ?? DEFAULT_JPEG_QUALITY
+    this.frameFormat = options.frameFormat ?? DEFAULT_FRAME_FORMAT
+    this.captureMax = options.captureMax ?? { width: DEFAULT_CAPTURE_MAX.width, height: DEFAULT_CAPTURE_MAX.height }
     this.viewport = options.viewport ?? { width: DEFAULT_VIEWPORT.width, height: DEFAULT_VIEWPORT.height }
     this.ringSize = options.ringSize ?? EVENT_RING_SIZE
     this.now = options.now ?? Date.now
@@ -345,10 +363,12 @@ export class TabManager {
     if (record.screencastRunning) return
     record.screencastRunning = true
     await this.transport.send('Page.startScreencast', {
-      format: 'jpeg',
+      format: this.frameFormat,
       quality: this.jpegQuality,
-      maxWidth: this.viewport.width,
-      maxHeight: this.viewport.height,
+      // The frame is fitted into the capture box: a smaller picture is the
+      // cheapest byte reduction available, and input is scaled back up.
+      maxWidth: this.captureMax.width,
+      maxHeight: this.captureMax.height,
       everyNthFrame: 1,
     }, record.sessionId)
   }
@@ -372,9 +392,18 @@ export class TabManager {
   async captureScreenshot(tabId: string): Promise<string> {
     const record = this.requireRecord(tabId)
     const result = await this.transport.send<{ data?: unknown }>('Page.captureScreenshot', {
-      format: 'jpeg',
+      format: this.frameFormat,
       quality: this.jpegQuality,
       captureBeyondViewport: false,
+      // Same box as the screencast, so an on-demand frame and a streamed frame
+      // are the same size and the pointer mapping is identical for both.
+      clip: {
+        x: 0,
+        y: 0,
+        width: this.viewport.width,
+        height: this.viewport.height,
+        scale: this.captureMax.width / this.viewport.width,
+      },
     }, record.sessionId)
     if (typeof result.data !== 'string' || result.data === '') {
       throw new Error('the browser returned an empty screenshot')
@@ -397,8 +426,9 @@ export class TabManager {
     const frame: ScreencastFrame = {
       tabId: record.id,
       seq: record.frameSeq,
-      width: this.viewport.width,
-      height: this.viewport.height,
+      width: this.captureSize().width,
+      height: this.captureSize().height,
+      format: this.frameFormat,
       data,
     }
     this.onFrame?.(frame)
@@ -406,10 +436,40 @@ export class TabManager {
   }
 
   /**
+   * The size a captured frame actually has: the capture box, clipped to the
+   * viewport's aspect ratio so both encodings agree on the picture.
+   * @returns capture size in CSS pixels.
+   */
+  private captureSize(): { width: number; height: number } {
+    const scale = this.captureMax.width / this.viewport.width
+    return {
+      width: Math.round(this.viewport.width * scale),
+      height: Math.round(this.viewport.height * scale),
+    }
+  }
+
+  /**
+   * Map a pointer position on the captured frame back onto the viewport.
+   * The panel scales its own display box onto the frame it was sent, so what
+   * arrives here is frame-relative; the browser needs viewport-relative.
+   * @param x - frame-relative x.
+   * @param y - frame-relative y.
+   * @returns viewport-relative coordinates.
+   */
+  private toViewport(x: number, y: number): { x: number; y: number } {
+    const captured = this.captureSize()
+    if (captured.width === this.viewport.width && captured.height === this.viewport.height) return { x, y }
+    return {
+      x: x * (this.viewport.width / captured.width),
+      y: y * (this.viewport.height / captured.height),
+    }
+  }
+
+  /**
    * Relay one panel input gesture into the tab over CDP.
    *
-   * The panel sends viewport CSS pixels it already scaled from its display
-   * size, so the coordinates go through unchanged. Modifier and button names
+   * The panel sends frame CSS pixels it already scaled from its display size,
+   * which this method maps back onto the viewport. Modifier and button names
    * map onto the CDP bit masks here, the contract stays human-readable.
    * @param tabId - target tab.
    * @param input - one validated gesture from the wire contract.
@@ -422,10 +482,11 @@ export class TabManager {
       const type = input.action === 'down'
         ? 'mousePressed'
         : input.action === 'up' ? 'mouseReleased' : 'mouseMoved'
+      const point = this.toViewport(input.x, input.y)
       await this.transport.send('Input.dispatchMouseEvent', {
         type,
-        x: input.x,
-        y: input.y,
+        x: point.x,
+        y: point.y,
         button,
         // A move carries no button state; a press or release holds its button.
         buttons: input.action === 'move' ? 0 : buttonMask,
@@ -434,10 +495,11 @@ export class TabManager {
       return
     }
     if (input.kind === 'wheel') {
+      const point = this.toViewport(input.x, input.y)
       await this.transport.send('Input.dispatchMouseEvent', {
         type: 'mouseWheel',
-        x: input.x,
-        y: input.y,
+        x: point.x,
+        y: point.y,
         deltaX: input.deltaX,
         deltaY: input.deltaY,
       }, record.sessionId)
@@ -690,10 +752,20 @@ export class TabManager {
       }
       if (typeof shaped.data !== 'string' || shaped.data === '') return
       record.frameSeq += 1
-      const metadata = shaped.metadata
-      const width = typeof metadata?.deviceWidth === 'number' ? Math.round(metadata.deviceWidth) : this.viewport.width
-      const height = typeof metadata?.deviceHeight === 'number' ? Math.round(metadata.deviceHeight) : this.viewport.height
-      this.onFrame?.({ tabId: record.id, seq: record.frameSeq, width, height, data: shaped.data })
+      // The frame's own size, not the metadata's: `deviceWidth`/`deviceHeight`
+      // describe the browser window, while `maxWidth`/`maxHeight` scale the
+      // picture into the capture box. Reporting the window size here would tell
+      // the panel a box 1.25x larger than the bytes it is showing, and every
+      // click would land off by that factor.
+      const size = this.captureSize()
+      this.onFrame?.({
+        tabId: record.id,
+        seq: record.frameSeq,
+        width: size.width,
+        height: size.height,
+        format: this.frameFormat,
+        data: shaped.data,
+      })
     }))
   }
 }

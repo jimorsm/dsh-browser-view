@@ -40,11 +40,13 @@ export interface BrowserViewFrame {
   readonly tabId: string
   /** Host-side monotonic counter for this tab. */
   readonly seq: number
-  /** Frame width in CSS pixels. */
+  /** Captured frame width in CSS pixels. */
   readonly width: number
-  /** Frame height in CSS pixels. */
+  /** Captured frame height in CSS pixels. */
   readonly height: number
-  /** Base64 JPEG, no data: prefix. */
+  /** Encoding of `data`; a host without the field always sent JPEG. */
+  readonly format?: 'jpeg' | 'webp'
+  /** Base64 image bytes, no data: prefix. */
   readonly data: string
 }
 
@@ -227,6 +229,9 @@ export function parseBrowserViewEvent(value: unknown): BrowserViewEvent | null {
       if (typeof candidate.width !== 'number') return null
       if (typeof candidate.height !== 'number') return null
       if (typeof candidate.data !== 'string') return null
+      // A host older than the format field always sent JPEG, so defaulting to
+      // it keeps such a host working instead of dropping every frame.
+      const format = candidate.format === 'webp' ? 'webp' : 'jpeg'
       return {
         v: BROWSER_VIEW_API_VERSION,
         kind: 'frame',
@@ -234,6 +239,7 @@ export function parseBrowserViewEvent(value: unknown): BrowserViewEvent | null {
         seq: candidate.seq,
         width: candidate.width,
         height: candidate.height,
+        format,
         data: candidate.data,
       }
     }
