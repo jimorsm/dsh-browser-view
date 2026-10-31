@@ -389,10 +389,10 @@ export class TabManager {
    * @param tabId - target tab.
    * @returns base64 JPEG without the `data:` prefix.
    */
-  async captureScreenshot(tabId: string): Promise<string> {
+  async captureScreenshot(tabId: string, format: FrameImageFormat = this.frameFormat): Promise<string> {
     const record = this.requireRecord(tabId)
     const result = await this.transport.send<{ data?: unknown }>('Page.captureScreenshot', {
-      format: this.frameFormat,
+      format,
       quality: this.jpegQuality,
       captureBeyondViewport: false,
       // Same box as the screencast, so an on-demand frame and a streamed frame

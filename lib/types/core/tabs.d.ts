@@ -185,7 +185,7 @@ export declare class TabManager {
      * @param tabId - target tab.
      * @returns base64 JPEG without the `data:` prefix.
      */
-    captureScreenshot(tabId: string): Promise<string>;
+    captureScreenshot(tabId: string, format?: FrameImageFormat): Promise<string>;
     /**
      * Capture a frame and hand it to the panel. An action calls this because a
      * screencast only emits when the compositor sees a change: a click that
