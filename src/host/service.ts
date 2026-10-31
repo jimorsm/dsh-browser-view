@@ -829,7 +829,10 @@ export class BrowserViewService implements BrowserViewBackend {
   async screenshot(sessionId: string | undefined, tabId?: string): Promise<{ tabId: string; url: string; title: string; data: string }> {
     const tab = await this.tabFor(sessionId, tabId)
     const tabs = await this.requireTabs()
-    const data = await tabs.captureScreenshot(tab.id)
+    // JPEG even when the stream is WebP: the screenshot tool declares
+    // image/jpeg and the host attachment service is typed to image/jpeg, so a
+    // WebP body would be rejected as "declared image type does not match bytes".
+    const data = await tabs.captureScreenshot(tab.id, 'jpeg')
     const current = tabs.list().find(candidate => candidate.id === tab.id) ?? tab
     return { tabId: current.id, url: current.url, title: current.title, data }
   }

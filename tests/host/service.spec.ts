@@ -396,6 +396,15 @@ describe('action traces', () => {
     const shot = await browser.service.screenshot('session-a')
     expect(shot.data).toBe('JPEG-BYTES')
     expect(shot.tabId).toBe(navigated.tab.id)
+    // And the tool's capture asks for JPEG even though the stream format is WebP
+    // (an action's on-demand refresh frame is WebP, hence "some" rather than a
+    // fixed index): this tool declares image/jpeg, and the host rejects a body
+    // that does not match its declaration ("Declared image type does not match
+    // its bytes").
+    const captureFormats = browser.transport
+      .callsOf('Page.captureScreenshot')
+      .map(call => (call.params as { format?: string }).format)
+    expect(captureFormats).toContain('jpeg')
   })
 
   it('operator reads console and network entries and the limit keeps the newest entries', async () => {
