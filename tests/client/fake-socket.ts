@@ -7,7 +7,9 @@
  */
 import type { BrowserActionTrace, BrowserPanelState, BrowserViewCommand } from '../../src/core/protocol.ts'
 import type {
+  BrowserViewDomBatch,
   BrowserViewFrame,
+  BrowserViewMirrorStatus,
   BrowserViewSocket,
   BrowserViewSocketHandlers,
   BrowserViewSocketStatus,
@@ -26,6 +28,8 @@ export interface FakeSocket {
   pushState(state: BrowserPanelState): void
   pushFrame(frame: BrowserViewFrame): void
   pushAction(trace: BrowserActionTrace): void
+  pushDom(batch: BrowserViewDomBatch): void
+  pushMirror(status: BrowserViewMirrorStatus): void
   pushError(code: string, message: string): void
   pushStatus(status: BrowserViewSocketStatus): void
 }
@@ -66,6 +70,12 @@ export function createFakeSockets(): FakeSocketFixture {
       },
       pushAction(trace: BrowserActionTrace): void {
         handlers.onAction(trace)
+      },
+      pushDom(batch: BrowserViewDomBatch): void {
+        handlers.onDom?.(batch)
+      },
+      pushMirror(status: BrowserViewMirrorStatus): void {
+        handlers.onMirror?.(status)
       },
       pushError(code: string, message: string): void {
         handlers.onError(code, message)

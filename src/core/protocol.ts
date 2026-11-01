@@ -21,6 +21,13 @@
  * bundle so they always agree, and the asymmetries are benign — an older panel
  * never sends `input`, and a newer panel against an older host only earns a
  * per-frame `invalid-command` error, not a closed socket.
+ *
+ * Kept at 1 again when the DOM mirror added the `mode` command and the `dom`
+ * and `mirror` events, for the same reason: a panel from before the mirror
+ * never asks for it, a host from before the mirror answers the request with one
+ * `invalid-command` error, and a panel that receives a kind it does not know
+ * drops that message instead of throwing. An added event kind must therefore
+ * never be one a panel has to understand to keep working.
  */
 export const BROWSER_VIEW_API_VERSION = 1
 
@@ -85,6 +92,25 @@ export interface BrowserPanelState {
   message?: string
 }
 
+/**
+ * Which lane a panel renders.
+ *
+ * `dom` is the DOM mirror: the page is serialized by the host and replayed as
+ * live DOM, which keeps text crisp and costs event-sized traffic instead of
+ * frame-sized. `pixels` is the original screencast, which is the only lane that
+ * can show a `<video>`, a canvas or native UI.
+ */
+export type BrowserViewLane = 'dom' | 'pixels'
+
+/**
+ * Lane a panel renders before it has said anything.
+ *
+ * Deliberately the pixel lane on the host side: a panel built before this
+ * feature existed never sends `mode`, and it must keep receiving exactly what
+ * it received before - frames, no mirror traffic, no recorder running.
+ */
+export const DEFAULT_VIEW_LANE: BrowserViewLane = 'pixels'
+
 /** One line of the panel's "what is the agent doing" trace. */
 export interface BrowserActionTrace {
   /** Tool name that produced the change, without its `browser_` prefix. */
@@ -120,6 +146,38 @@ export type BrowserViewEvent =
       data: string
     }
   | { v: 1; kind: 'action'; trace: BrowserActionTrace }
+  | {
+      v: 1
+      kind: 'dom'
+      /** Tab the mirrored events belong to. */
+      tabId: string
+      /** Monotonic per-tab counter over mirror batches, so a slow panel drops stale ones. */
+      seq: number
+      /**
+       * True when `events` start a recording rather than continue one: the
+       * panel drops its replayer and rebuilds it from this batch. The host sets
+       * it for the first batch a panel ever receives, and again whenever the
+       * recording's history was truncated (a navigation, an rrweb checkpoint).
+       */
+      reset?: boolean
+      /**
+       * rrweb recording events in recording order, opaque to this contract: the
+       * panel hands them to rrweb's replayer untouched. One batch carries one
+       * event today, but the shape stays a list so a batching host needs no
+       * contract change.
+       */
+      events: unknown[]
+    }
+  | {
+      v: 1
+      kind: 'mirror'
+      /** Tab the mirror status belongs to. */
+      tabId: string
+      /** Whether the DOM mirror is running for that tab. */
+      available: boolean
+      /** Why the mirror could not start, shown to the person watching. */
+      reason?: string
+    }
   | { v: 1; kind: 'rtc-answer'; sdp: string }
   | { v: 1; kind: 'error'; code: string; message: string }
 
@@ -130,6 +188,7 @@ export type BrowserViewCommand =
   | { v: 1; kind: 'request-frame' }
   | { v: 1; kind: 'close-tab'; tabId: string }
   | { v: 1; kind: 'input'; input: BrowserInputEvent }
+  | { v: 1; kind: 'mode'; mode: BrowserViewLane }
   | { v: 1; kind: 'rtc-offer'; sdp: string }
   | { v: 1; kind: 'stream'; enabled: boolean }
 
@@ -280,6 +339,8 @@ export function isBrowserViewCommand(value: unknown): value is BrowserViewComman
       return true
     case 'input':
       return isBrowserInputEvent(candidate.input)
+    case 'mode':
+      return candidate.mode === 'dom' || candidate.mode === 'pixels'
     case 'rtc-offer':
       return typeof candidate.sdp === 'string' && candidate.sdp.length > 0
     case 'stream':

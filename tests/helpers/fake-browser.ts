@@ -20,6 +20,9 @@ const FAKE_NODES = [
   { tag: 'button', depth: 1, selector: 'body > button', role: 'button', name: 'Go' },
 ]
 
+/** Recorder text the fake host injects; the real bundle is megabytes. */
+export const FAKE_MIRROR_SOURCE = '/* rrweb stub */'
+
 /** What the fake session exposes to a test. */
 export interface FakeBrowser {
   service: BrowserViewService
@@ -42,6 +45,8 @@ export function createFakeBrowser(options: {
   frameIntervalMs?: { idle?: number; interactive?: number }
   /** Replace the WebRTC relay, which needs a real peer connection otherwise. */
   createRelay?: () => FrameRelay
+  /** Recorder bundle the mirror injects; a stub by default. */
+  mirrorSource?: () => string
 } = {}): FakeBrowser {
   const transport = new FakeTransport()
   let tabCounter = 0
@@ -51,8 +56,12 @@ export function createFakeBrowser(options: {
   transport.responses.set('Target.createTarget', () => ({ targetId: `tab-${++tabCounter}` }))
   transport.responses.set('Target.attachToTarget', () => ({ sessionId: `session-${tabCounter}` }))
   transport.responses.set('Page.captureScreenshot', { data: 'JPEG-BYTES' })
+  transport.responses.set('Page.addScriptToEvaluateOnNewDocument', () => ({ identifier: 'mirror-script' }))
   transport.responses.set('Runtime.evaluate', (params: Record<string, unknown>) => {
     const expression = String(params.expression ?? '')
+    // The mirror's bootstrap answers with the verdict the host reads, not with
+    // page data.
+    if (expression.includes('dshBrowserViewDomMirror')) return { result: { value: 'ok' } }
     if (expression.includes('document.querySelector')) {
       return { result: { value: { ok: true, x: 12, y: 34, tag: 'button', name: 'Go' } } }
     }
@@ -75,6 +84,9 @@ export function createFakeBrowser(options: {
     // and by the real defaults.
     frameIntervalMs: options.frameIntervalMs ?? { idle: 0, interactive: 0 },
     ...(options.createRelay === undefined ? {} : { createRelay: options.createRelay }),
+    // A recorder source is always injected: the built artifact is absent in a
+    // source checkout, and a test that has to build first is not a test.
+    mirrorSource: options.mirrorSource ?? (() => FAKE_MIRROR_SOURCE),
     openSession: async (opts): Promise<BrowserSession> => {
       opens += 1
       const failure = options.failLaunch?.()

@@ -39,6 +39,28 @@ to this package; the upstream dsh-web monorepo rules do not apply here.
   判定在 `TabManager.dispatchInput`）。契约新增命令类型时版本号保持不变的前提是
   旧面板不会发新命令、新面板对旧 host 只会换来单帧 invalid-command 错误；破坏该
   前提才递增 `BROWSER_VIEW_API_VERSION`。能连 socket 即能发输入，安全模型随围栏。
+- 双通道：面板默认走 **DOM 镜像**（`src/core/mirror.ts` 注入 rrweb 录制器并收集
+  `Runtime.bindingCalled`，`src/client/mirror.ts` 用 rrweb 重放器 live 还原），
+  像素通道保持原样、一键可切，镜像起不来时宿主把它降级回像素并发
+  `mirror{available:false,reason}`（面板显示原因，不是空舞台）。面板用 `mode`
+  命令声明自己渲染哪条通道；**没发过 `mode` 的老面板行为逐字节不变**（宿主默认
+  像素、不注入）。契约面是 `tests/host/service.spec.ts` 的「dom mirror lane」
+  与 `tests/core/mirror.spec.ts`。
+- 镜像注入三条硬约束，改动前先读 `src/core/mirror.ts` 的注释：① 页面域命令必须
+  带标签页的 flat session（`TabManager.sessionOf`），浏览器级 socket 上
+  `Runtime.*` 会被 `-32601` 拒；② 注入脚本只能在顶层 frame 录制
+  （`window.top !== window` 直接返回），因为 rrweb 的 `record()` 会为自己插一个
+  隐藏 iframe 探测未污染的 `Array.from`，而 `addScriptToEvaluateOnNewDocument`
+  对每个新文档都生效——少了这个守卫就是无限套娃（实测 1.2 秒 500 个 frame，
+  渲染进程卡死）；③ 重放器的 live 基准必须取录制首批事件的时间戳
+  （`liveBaseline`），给 `Date.now()` 会让基线之前的事件走进 rrweb 的同步/
+  虚拟 DOM 路径而被静默丢掉。镜像**只读**：镜像里的点击不回传成 CDP 动作，
+  输入仍只走像素画面。
+- 打包：`rrweb` 是运行时依赖，宿主注入的是本包发布的 `lib/rrweb.umd.cjs`
+  （`build/copy-mirror.mjs` 在 `pnpm build` 末尾从 rrweb 的 dist 复制），运行时
+  **不解析 `node_modules` 路径**。客户端 bundle 被 `tsdown.config.ts` 钉成单文件
+  （`inlineDynamicImports`），否则懒加载的 rrweb 会被拆成第二个 chunk，而
+  closure factory 的 `require` 只认模块表、不认文件系统。
 - 构建：`build/tsdown.client.ts` 与 `build/web-platform.ts` 是从上游 dsh-web 的
   `shared/` 逐字 vendored 的构建预设（本仓不依赖上游 monorepo 检出，见 NOTICE）。
   改这两个文件等于把上游预设本地分叉，同步上游时要显式对齐。

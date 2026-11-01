@@ -14,7 +14,7 @@ This package is an external plugin for DeepSeek Harness (DSH), structured as a c
 
 ## What it does
 
-- **A live tab, not a screenshot poll**: CDP `Page.startScreencast` frames arrive over one WebSocket and are painted as they come. The tab shows the active page, its URL and title, and what the agent last did.
+- **A live tab, not a screenshot poll**: the page is mirrored as live DOM by default (rrweb's recorder in the page, rrweb's replayer in the panel), so text stays crisp and traffic is event-sized; the pixel lane (`Page.startScreencast`) is one click away and is what a `<video>`, a canvas or native UI needs. The tab shows the active page, its URL and title, and what the agent last did.
 - **Eleven agent tools**: `browser_navigate`, `browser_click`, `browser_type`, `browser_press`, `browser_scroll`, `browser_snapshot`, `browser_screenshot`, `browser_console`, `browser_network`, `browser_tabs`, `browser_close` (closes only the tabs this session opened).
 - **Evidence in the conversation**: every `browser_screenshot` result carries the image, so the transcript keeps the picture the agent acted on instead of only a sentence about it.
 - **One dedicated browser**: the plugin launches its own Chromium with a throwaway profile. It never attaches to a browser you are signed into unless you opt in with `DSH_BROWSER_VIEW_ATTACH_PORT` (see Security model).
@@ -44,6 +44,26 @@ Bandwidth is designed for "look when you need to, step in when you must", not fo
 | Capture box | Captured at 1024x640 (the browser viewport stays 1280x800); pointer coordinates are scaled back up, so clicking stays exact |
 | Frame budget | At most about 15 fps while nobody interacts, opened to about 30 fps for three seconds after any input |
 | Invisible means stopped | A collapsed sidebar, another chip in front, or a hidden browser tab tells the host; the **last** watching panel leaving stops the screencast outright - nothing is captured, encoded or sent - and returning restores it with one fresh frame |
+
+## Two lanes: the DOM mirror and the pixels
+
+The panel renders the page **twice over**, and you choose which:
+
+| Lane | How it works | What it is for |
+| --- | --- | --- |
+| DOM mirror (default) | The host injects rrweb's recorder into the tab (`Page.addScriptToEvaluateOnNewDocument` for future documents, `Runtime.evaluate` for the loaded one), records each mutation and streams it to the panel, which replays it with rrweb's own replayer in live mode | Text and UI pages: crisp at any panel width, and traffic proportional to what changed rather than to how often the page repaints |
+| Pixel stream | CDP `Page.startScreencast` frames, exactly as before | `<video>`, canvas, native UI and DRM - anything a DOM cannot express - and the automatic fallback |
+
+The switch sits in the toolbar. The mirror is **read-only**: a click on a replayed node is not mapped back to a CDP action, because rrweb renders into its own iframe whose nodes are a reconstruction rather than the page. Input stays on the pixel lane.
+
+Two things are deliberate about the mirror's cost:
+
+- **It only runs while somebody watches.** The recorder is armed when a visible panel asks for that lane and stopped when the last one stops asking (or hides), and it follows the watched tab, so a background tab never records.
+- **The pixel lane stays warm until the mirror has something to draw.** Frames keep arriving until the first full snapshot reaches a panel, so switching lanes never trades a live picture for an empty stage. If the mirror cannot start - the page refuses the injected script, the recorder throws, the bundled artifact is missing - the panel falls back to pixels automatically **and shows the reason** instead of a blank viewer.
+
+Measured on this repository's own fixtures (5 second windows, one lane at a time, headless Chromium at 1280x800): on `grid.html`, a static page, both lanes are silent after the first paint; on `heavy.html`, 4000 absolutely-positioned nodes with 400 inline-style mutations every 50 ms, pixels cost 1169 KiB/s and the mirror 1093 KiB/s. That fixture is the mirror's worst case - it rewrites most of the document's inline styles twenty times a second - and it is worth knowing that "cheaper" is a property of the page, not of the lane: a page that mutates a little is nearly free to mirror, one that mutates everything constantly is not.
+
+Packaging: `rrweb` is a runtime dependency, and the host injects the **UMD build this package ships** - `lib/rrweb.umd.cjs`, copied from rrweb's dist by `pnpm build`. The host never resolves a `node_modules` path at runtime, because the installed layout is not this repository's. The panel's replayer rides the normal client bundle (lazily imported, and the bundle is pinned to a single file so the module loader can serve it).
 
 ## Interface seats
 
@@ -78,6 +98,7 @@ The single-occupant `rightbar` / `rightbar.session` seats are still not touched:
 - The token top-up only covers the site root, because DSH answers the challenge with a 303 to `./` for `GET /` alone.
 - One browser process per host; tabs are isolated CDP targets, not separate profiles.
 - Chrome must be installed at a standard location (or named by `CHROME_PATH`).
+- The DOM mirror is a non-goal for audio: the recorder is configured for DOM only, and `<video>` audio is not captured on either lane.
 
 ## Install
 

@@ -102,6 +102,18 @@
   box-shadow: 0 0 0 2px var(--dsw-alias-bg-base), 0 0 0 4px var(--dsw-alias-brand-primary);
 }
 
+/* The lane switch: the one control that is a word rather than an icon, because
+   the two lanes are what the person watching is choosing between and neither
+   has an icon anybody would read. Same box as the icon buttons, sized to its
+   text. */
+.tool.mode {
+  width: auto;
+  min-width: 28px;
+  padding: 0 7px;
+  font: var(--dsw-font-xxxs-11);
+  white-space: nowrap;
+}
+
 /* The address display: read-only, since navigation belongs to the agent's
    tools. It truncates, keeps the full address on the title attribute, and its
    text stays selectable - the body selects all of it on click - so the address
@@ -235,6 +247,69 @@
   height: auto;
   margin: auto;
   object-fit: contain;
+}
+
+/* -- DOM mirror stage --
+
+   rrweb's replayer appends its own `.replayer-wrapper` to this element and
+   scales the recorded document inside it, so the only job here is to give the
+   wrapper a box to fill and to keep the replay from bleeding past the column.
+   rrweb's own replayer stylesheet positions that wrapper, so this file must not
+   duplicate it - overriding `position` would break the mouse overlay rrweb draws
+   in the same wrapper. */
+
+.mirror {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  background: var(--dsw-alias-bg-base);
+}
+
+/* rrweb ships this rule in its own replayer stylesheet, which the client bundle
+   does not load (it would be a second stylesheet the shell has to own). The
+   wrapper is the positioning context for the mouse overlay rrweb draws inside
+   it, so without this the overlay resolves against the viewport. */
+.mirror :global(.replayer-wrapper) {
+  position: relative;
+}
+
+.mirror canvas,
+.mirror iframe {
+  border: 0;
+  background: transparent;
+}
+
+/* Hidden, not unmounted, while the pixel lane still has the stage: the
+   replayer is built into this element and a remount would lose the replay. */
+.mirrorIdle {
+  display: none;
+}
+
+/* The mirror is running but has nothing to draw yet (no recording, or a
+   batch that arrived for a tab the panel has already left). */
+.mirrorNote {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  margin: auto;
+  padding: 20px 16px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+  text-align: center;
+}
+
+/* Why the mirror is not running. Kept beside the picture it fell back to
+   rather than over it: the pixel lane is live and readable underneath. */
+.mirrorNotice {
+  flex: none;
+  padding: 4px 10px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 16px;
+  border-top: 0.5px solid var(--dsw-alias-border-l3);
 }
 
 .empty,
