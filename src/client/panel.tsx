@@ -126,10 +126,13 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
   const [error, setError] = useState<{ readonly code: string; readonly message: string } | null>(null)
   const [status, setStatus] = useState<BrowserViewSocketStatus>('connecting')
   /**
-   * Lane this panel renders. The DOM mirror is the default because it is the
-   * cheap, crisp one; the pixel lane is what the switch and the fallback use.
+   * Lane this panel renders. The pixel lane is the default: it draws any page,
+   * including the video and canvas pages a mirror has no picture for, and its
+   * cost is predictable. The DOM mirror is one click away for crisp text and for
+   * pages that mutate little - measured savings are a property of the page, not
+   * of the lane, so the lane nobody asked for should not be the one they get.
    */
-  const [lane, setLane] = useState<BrowserViewLane>('dom')
+  const [lane, setLane] = useState<BrowserViewLane>('pixels')
   /** Bumped for every checkpoint batch, which is what rebuilds the replayer. */
   const [mirrorCheckpoints, setMirrorCheckpoints] = useState(0)
   /** Whether the replayer is mounted and drawing. */
@@ -140,7 +143,7 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
   /** Last active tab seen in a state push; a tab switch invalidates the picture. */
   const lastActiveTabRef = useRef<string | null>(null)
   /** Lane the panel asked the host for, readable from socket callbacks. */
-  const laneRef = useRef<BrowserViewLane>('dom')
+  const laneRef = useRef<BrowserViewLane>('pixels')
   /** The checkpoint batch the replayer is (re)built from. */
   const mirrorCheckpointRef = useRef<ReadonlyArray<unknown>>([])
   /** Mounted replayer; live events are pushed into it as they arrive. */
