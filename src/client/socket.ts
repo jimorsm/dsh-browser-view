@@ -5,8 +5,10 @@
  * actions and errors over one socket per mounted panel (see ../core/protocol.ts
  * for the frozen wire contract). This module is the only place the browser half
  * touches the wire: it derives the page or shell-owned socket URL, narrows every
- * incoming message through the protocol's discriminant, drops stale frames,
- * and reconnects with exponential backoff.
+ * incoming message through the protocol's discriminant, drops stale frames and
+ * stale mirror batches, and reconnects with exponential backoff. A kind this
+ * version does not know is dropped, never thrown: an added event kind is how the
+ * contract grows without a version bump.
  *
  * Nothing here imports the DOM's WebSocket type directly: the constructor is
  * injectable so the tests drive a fake transport instead of a network.
@@ -50,6 +52,28 @@ export interface BrowserViewFrame {
   readonly data: string
 }
 
+/** One decoded batch of mirror events, exactly as the panel needs it. */
+export interface BrowserViewDomBatch {
+  /** Tab the recording belongs to. */
+  readonly tabId: string
+  /** Host-side monotonic counter over mirror batches. */
+  readonly seq: number
+  /** Whether `events` start a recording rather than continue one. */
+  readonly reset: boolean
+  /** rrweb recording events, in recording order. */
+  readonly events: ReadonlyArray<unknown>
+}
+
+/** Whether the host's DOM mirror is running for one tab. */
+export interface BrowserViewMirrorStatus {
+  /** Tab the status describes. */
+  readonly tabId: string
+  /** Whether the mirror is running. */
+  readonly available: boolean
+  /** Why it is not, when the host reported a failure. */
+  readonly reason?: string
+}
+
 /** Callbacks the panel installs on a connection. */
 export interface BrowserViewSocketHandlers {
   /** Connection phase changed. */
@@ -58,6 +82,10 @@ export interface BrowserViewSocketHandlers {
   onState(state: BrowserPanelState): void
   /** A fresh frame arrived, already filtered for staleness. */
   onFrame(frame: BrowserViewFrame): void
+  /** A batch of DOM mirror events arrived, already filtered for staleness. */
+  onDom?(batch: BrowserViewDomBatch): void
+  /** The host reported whether the DOM mirror runs for a tab. */
+  onMirror?(status: BrowserViewMirrorStatus): void
   /** The agent performed one tool action. */
   onAction(trace: BrowserActionTrace): void
   /** The host reported a failure the panel must show instead of a frame. */
@@ -243,6 +271,32 @@ export function parseBrowserViewEvent(value: unknown): BrowserViewEvent | null {
         data: candidate.data,
       }
     }
+    case 'dom': {
+      if (typeof candidate.tabId !== 'string') return null
+      if (typeof candidate.seq !== 'number') return null
+      if (!Array.isArray(candidate.events)) return null
+      // A host that never learned to cut batches still sends whole ones; an
+      // absent reset means "continue", which is the safe reading.
+      return {
+        v: BROWSER_VIEW_API_VERSION,
+        kind: 'dom',
+        tabId: candidate.tabId,
+        seq: candidate.seq,
+        reset: candidate.reset === true,
+        events: candidate.events,
+      }
+    }
+    case 'mirror': {
+      if (typeof candidate.tabId !== 'string') return null
+      if (typeof candidate.available !== 'boolean') return null
+      return {
+        v: BROWSER_VIEW_API_VERSION,
+        kind: 'mirror',
+        tabId: candidate.tabId,
+        available: candidate.available,
+        ...(typeof candidate.reason === 'string' ? { reason: candidate.reason } : {}),
+      }
+    }
     case 'action': {
       const trace = candidate.trace
       if (typeof trace !== 'object' || trace === null) return null
@@ -302,6 +356,8 @@ export function connectBrowserViewSocket(
   let timer: unknown = null
   const pending: BrowserViewCommand[] = []
   const lastSeqByTab = new Map<string, number>()
+  /** Last mirror batch drawn per tab; one recording is a stream, not a value. */
+  const lastDomSeqByTab = new Map<string, number>()
 
   /** Publish a phase change once. */
   const setStatus = (next: BrowserViewSocketStatus): void => {
@@ -341,6 +397,25 @@ export function connectBrowserViewSocket(
         })
         return
       }
+      case 'dom': {
+        const previous = lastDomSeqByTab.get(event.tabId)
+        if (previous !== undefined && event.seq <= previous) return
+        lastDomSeqByTab.set(event.tabId, event.seq)
+        handlers.onDom?.({
+          tabId: event.tabId,
+          seq: event.seq,
+          reset: event.reset === true,
+          events: event.events,
+        })
+        return
+      }
+      case 'mirror':
+        handlers.onMirror?.({
+          tabId: event.tabId,
+          available: event.available,
+          ...(event.reason === undefined ? {} : { reason: event.reason }),
+        })
+        return
       case 'action':
         handlers.onAction(event.trace)
         return
@@ -393,6 +468,9 @@ export function connectBrowserViewSocket(
       if (disposed) return
       attempt = 0
       lastSeqByTab.clear()
+      // The host's mirror counters restart with the host; keeping the old
+      // high-water marks would drop the whole fresh recording.
+      lastDomSeqByTab.clear()
       setStatus('open')
       while (pending.length > 0) {
         const command = pending.shift()

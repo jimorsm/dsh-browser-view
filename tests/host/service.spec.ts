@@ -568,3 +568,272 @@ describe('stream budget and idle panels', () => {
     expect(alice.events.filter(event => event.kind === 'frame')).toHaveLength(2)
   })
 })
+
+describe('dom mirror lane', () => {
+  /** One rrweb event as the recorder would emit it. */
+  const recorded = (type: number, timestamp: number): Record<string, unknown> => ({ type, timestamp })
+
+  /** Deliver one recorder payload the way the browser does. */
+  function emitDom(
+    transport: ReturnType<typeof createFakeBrowser>['transport'],
+    event: unknown,
+    sessionId: string,
+  ): void {
+    transport.emit('Runtime.bindingCalled', {
+      name: 'dshBrowserViewDomMirror',
+      payload: JSON.stringify(event),
+      executionContextId: 1,
+    }, sessionId)
+  }
+
+  /** Take one snapshot's worth of recording on the tab's session. */
+  function recordSnapshot(
+    transport: ReturnType<typeof createFakeBrowser>['transport'],
+    sessionId: string,
+    stamp = 1,
+  ): void {
+    emitDom(transport, recorded(4, stamp), sessionId)
+    emitDom(transport, recorded(2, stamp + 1), sessionId)
+  }
+
+  it('a panel asks for the DOM lane and the tab is armed on its own session', async () => {
+    // Given one open tab and an attached panel
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    const tab = await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    browser.transport.calls.length = 0
+
+    // When the panel asks for the mirror
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'dom' })
+
+    // Then the recorder is armed on the tab's page session, and only then
+    expect(browser.transport.callsOf('Page.addScriptToEvaluateOnNewDocument')[0]?.sessionId).toBe('session-1')
+    expect(browser.transport.callsOf('Runtime.addBinding')[0]?.sessionId).toBe('session-1')
+    expect(tab.id).toBe('tab-1')
+  })
+
+  it('a panel that never asks for a lane records nothing', async () => {
+    // Given one open tab and an attached panel that says nothing about lanes
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // When the panel models the default behaviour
+    // Then no recorder was ever injected, so a panel from before the mirror
+    // existed costs the page nothing
+    expect(browser.transport.callsOf('Runtime.addBinding')).toHaveLength(0)
+    expect(browser.transport.callsOf('Page.addScriptToEvaluateOnNewDocument')).toHaveLength(0)
+  })
+
+  it('a mirroring panel receives the recording and stops paying for frames', async () => {
+    // Given a panel watching the DOM lane with a recorded snapshot
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'dom' })
+    recordSnapshot(browser.transport, 'session-1')
+    alice.events.length = 0
+
+    // When one more mutation arrives
+    emitDom(browser.transport, recorded(3, 5), 'session-1')
+
+    // Then it travels as one non-reset batch and the screencast is stopped,
+    // because this panel no longer renders pixels
+    const dom = alice.events.filter(event => event.kind === 'dom')
+    expect(dom).toHaveLength(1)
+    // No `reset`: a batch that continues the recording is the default reading.
+    expect(dom[0]).toEqual({
+      v: 1,
+      kind: 'dom',
+      tabId: 'tab-1',
+      seq: expect.any(Number),
+      events: [recorded(3, 5)],
+    })
+    expect(browser.transport.callsOf('Page.stopScreencast')).toHaveLength(1)
+  })
+
+  it('a panel that attaches late gets the recording from its checkpoint', async () => {
+    // Given a tab that is already recording for one panel
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    const bob = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'dom' })
+    recordSnapshot(browser.transport, 'session-1')
+
+    // When a second panel asks for the same mirror
+    browser.service.attach(bob.sink)
+    bob.events.length = 0
+    await browser.service.handleCommand(bob.sink, { v: 1, kind: 'mode', mode: 'dom' })
+    emitDom(browser.transport, recorded(3, 9), 'session-1')
+
+    // Then that panel does not have to have been there from the start: the
+    // first batch it receives is the whole recording and says so
+    const first = bob.events.find(event => event.kind === 'dom')
+    expect(first).toMatchObject({ reset: true, tabId: 'tab-1' })
+    expect((first as { events: unknown[] }).events.length).toBeGreaterThanOrEqual(3)
+  })
+
+  it('a hidden panel receives no mirror traffic while another keeps it', async () => {
+    // Given two mirroring panels on one tab
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    const bob = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    browser.service.attach(bob.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'dom' })
+    await browser.service.handleCommand(bob.sink, { v: 1, kind: 'mode', mode: 'dom' })
+    recordSnapshot(browser.transport, 'session-1')
+    alice.events.length = 0
+    bob.events.length = 0
+
+    // When one of them reports its tab left the screen
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'stream', enabled: false })
+    emitDom(browser.transport, recorded(3, 6), 'session-1')
+
+    // Then only the watching panel pays for the event
+    expect(alice.events.filter(event => event.kind === 'dom')).toHaveLength(0)
+    expect(bob.events.filter(event => event.kind === 'dom')).toHaveLength(1)
+  })
+
+  it('the last hidden panel stops the recorder itself', async () => {
+    // Given one mirroring panel
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'dom' })
+    browser.transport.calls.length = 0
+
+    // When it reports itself hidden
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'stream', enabled: false })
+
+    // Then the recorder is stopped and its registration withdrawn: a page
+    // nobody watches records nothing, on this document or the next
+    expect(browser.transport.callsOf('Runtime.evaluate').length).toBeGreaterThan(0)
+    expect(browser.transport.callsOf('Page.removeScriptToEvaluateOnNewDocument')).toHaveLength(1)
+  })
+
+  it('a panel that comes back rebuilds from a fresh recording', async () => {
+    // Given a mirroring panel that went hidden after a snapshot
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'dom' })
+    recordSnapshot(browser.transport, 'session-1')
+    emitDom(browser.transport, recorded(3, 4), 'session-1')
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'stream', enabled: false })
+    alice.events.length = 0
+
+    // When it becomes visible again
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'stream', enabled: true })
+
+    // Then the recorder is armed again and the pixel lane covers the moment in
+    // between, so the stage is never empty while the page re-snapshots
+    expect(browser.transport.callsOf('Page.addScriptToEvaluateOnNewDocument').length).toBeGreaterThan(0)
+    expect(alice.events.filter(event => event.kind === 'frame')).toHaveLength(1)
+
+    // And when the page snapshots, the batch carries the whole fresh recording
+    recordSnapshot(browser.transport, 'session-1', 20)
+    emitDom(browser.transport, recorded(3, 30), 'session-1')
+    const dom = alice.events.filter(event => event.kind === 'dom')
+    expect(dom[0]).toMatchObject({ reset: true })
+    expect((dom[0] as { events: unknown[] }).events).toEqual([recorded(4, 20), recorded(2, 21)])
+    expect(dom[1]).toMatchObject({ events: [recorded(3, 30)] })
+  })
+
+  it('a panel switches back to pixels and frames start flowing again', async () => {
+    // Given a mirroring panel whose mirror is live
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'dom' })
+    recordSnapshot(browser.transport, 'session-1')
+    emitDom(browser.transport, recorded(3, 3), 'session-1')
+    alice.events.length = 0
+
+    // When it asks for pixels
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'pixels' })
+
+    // Then the screencast runs again and a fresh frame arrives immediately
+    expect(browser.transport.callsOf('Page.startScreencast').length).toBeGreaterThan(0)
+    expect(alice.events.filter(event => event.kind === 'frame')).toHaveLength(1)
+    expect(browser.transport.callsOf('Page.removeScriptToEvaluateOnNewDocument')).toHaveLength(1)
+  })
+
+  it('the mirror cannot be injected and the panel is moved to pixels with the reason', async () => {
+    // Given a transport whose bootstrap reports the page rejected the recorder
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    browser.transport.responses.set('Runtime.evaluate', () => ({
+      exceptionDetails: { text: 'Uncaught', exception: { description: 'Error: eval is blocked' } },
+    }))
+    alice.events.length = 0
+
+    // When the panel asks for the mirror
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'dom' })
+
+    // Then it is told why, moved to pixels, and a frame follows so the stage is
+    // never empty
+    const notice = alice.events.find(event => event.kind === 'mirror')
+    expect(notice).toMatchObject({ v: 1, kind: 'mirror', tabId: 'tab-1', available: false })
+    expect((notice as { reason: string }).reason).toMatch(/eval is blocked/)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'request-frame' })
+    expect(alice.events.filter(event => event.kind === 'frame').length).toBeGreaterThan(0)
+  })
+
+  it('the mirror cannot be injected and the host does not retry it on every state change', async () => {
+    // Given a mirror whose injection always fails
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    browser.transport.responses.set('Runtime.evaluate', () => ({
+      exceptionDetails: { text: 'Uncaught', exception: { description: 'Error: eval is blocked' } },
+    }))
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'dom' })
+    const bootstraps = (): number => browser.transport
+      .callsOf('Runtime.evaluate')
+      .filter(call => String(call.params.expression).includes('dshBrowserViewDomMirror'))
+      .length
+    const attempts = bootstraps()
+
+    // When the tab changes state repeatedly
+    await browser.transport.emit('Page.frameStartedLoading', {}, 'session-1')
+    await browser.transport.emit('Page.loadEventFired', {}, 'session-1')
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Then no second doomed injection was attempted
+    expect(bootstraps()).toBe(attempts)
+  })
+
+  it('a tab nobody watches records nothing even when a panel wants the mirror', async () => {
+    // Given two tabs and a panel watching the first
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    const first = await browser.service.ensureTab('session-a')
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'attach' })
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'select-tab', tabId: first.id })
+    browser.transport.calls.length = 0
+
+    // When the agent opens a second tab while the panel stays on the first
+    await browser.service.ensureTab('session-b')
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Then the recorder followed the watched tab: it was stopped for the first
+    // and never armed for the tab nobody is rendering
+    expect(browser.transport.callsOf('Page.addScriptToEvaluateOnNewDocument')).toHaveLength(0)
+    expect(browser.transport.callsOf('Runtime.addBinding')).toHaveLength(0)
+  })
+})

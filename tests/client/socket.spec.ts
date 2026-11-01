@@ -6,7 +6,12 @@
  */
 import { describe, expect, it, vi } from 'vitest'
 import { BROWSER_VIEW_SOCKET_PATH } from '../../src/core/protocol.ts'
-import type { BrowserViewSocketHandlers, BrowserViewWebSocketLike } from '../../src/client/socket.ts'
+import type {
+  BrowserViewDomBatch,
+  BrowserViewMirrorStatus,
+  BrowserViewSocketHandlers,
+  BrowserViewWebSocketLike,
+} from '../../src/client/socket.ts'
 import {
   RECONNECT_BASE_MS,
   RECONNECT_MAX_MS,
@@ -73,6 +78,8 @@ interface Recorded {
   readonly frames: Array<{ tabId: string; seq: number }>
   readonly actions: Array<{ tool: string; summary: string }>
   readonly errors: Array<{ code: string; message: string }>
+  readonly doms: BrowserViewDomBatch[]
+  readonly mirrors: BrowserViewMirrorStatus[]
   readonly states: unknown[]
   readonly statuses: string[]
 }
@@ -82,6 +89,8 @@ function record(): Recorded {
   const frames: Array<{ tabId: string; seq: number }> = []
   const actions: Array<{ tool: string; summary: string }> = []
   const errors: Array<{ code: string; message: string }> = []
+  const doms: BrowserViewDomBatch[] = []
+  const mirrors: BrowserViewMirrorStatus[] = []
   const states: unknown[] = []
   const statuses: string[] = []
   const handlers: BrowserViewSocketHandlers = {
@@ -89,9 +98,11 @@ function record(): Recorded {
     onState: (state) => { states.push(state) },
     onFrame: (frame) => { frames.push({ tabId: frame.tabId, seq: frame.seq }) },
     onAction: (trace) => { actions.push({ tool: trace.tool, summary: trace.summary }) },
+    onDom: (batch) => { doms.push(batch) },
+    onMirror: (mirror) => { mirrors.push(mirror) },
     onError: (code, message) => { errors.push({ code, message }) },
   }
-  return { handlers, frames, actions, errors, states, statuses }
+  return { handlers, frames, actions, errors, doms, mirrors, states, statuses }
 }
 
 /** Timer seam that runs callbacks only when the test advances them. */
@@ -416,5 +427,108 @@ describe('browser view socket lifecycle', () => {
     expect(socket.status()).toBe('closed')
     expect(seen.statuses).toContain('closed')
     vi.restoreAllMocks()
+  })
+})
+
+describe('browser view mirror events', () => {
+  it('host streams a recording and the panel walks the checkpoint then the increments', () => {
+    // Given an open socket with a mirror handler
+    resetTransports()
+    const seen = record()
+    connectBrowserViewSocket(seen.handlers, { WebSocketImpl: FakeTransport, location: origin })
+    const transport = FakeTransport.instances[0]
+    transport.fireOpen()
+
+    // When a checkpoint batch and then one increment arrive
+    transport.fireMessage({
+      v: 1, kind: 'dom', tabId: 'tab-1', seq: 1, reset: true,
+      events: [{ type: 4 }, { type: 2 }],
+    })
+    transport.fireMessage({ v: 1, kind: 'dom', tabId: 'tab-1', seq: 2, events: [{ type: 3 }] })
+
+    // Then both reach the panel, the first one marked as the start of a recording
+    expect(seen.doms).toEqual([
+      { tabId: 'tab-1', seq: 1, reset: true, events: [{ type: 4 }, { type: 2 }] },
+      { tabId: 'tab-1', seq: 2, reset: false, events: [{ type: 3 }] },
+    ])
+  })
+
+  it('host sends a batch the panel already drew and it is dropped, per tab', () => {
+    // Given an open socket that drew sequence 5 and 6 for one tab
+    resetTransports()
+    const seen = record()
+    connectBrowserViewSocket(seen.handlers, { WebSocketImpl: FakeTransport, location: origin })
+    const transport = FakeTransport.instances[0]
+    transport.fireOpen()
+    const batch = (tabId: string, seq: number): unknown => ({ v: 1, kind: 'dom', tabId, seq, events: [{ type: 3 }] })
+
+    transport.fireMessage(batch('tab-1', 5))
+    transport.fireMessage(batch('tab-1', 5))
+    transport.fireMessage(batch('tab-1', 4))
+    transport.fireMessage(batch('tab-2', 4))
+
+    // Then only the first of the pair survived, and the other tab has its own counter
+    expect(seen.doms.map(entry => `${entry.tabId}:${entry.seq}`)).toEqual(['tab-1:5', 'tab-2:4'])
+  })
+
+  it('host reconnects and the mirror counters restart with it', () => {
+    // Given a socket that drew a high sequence number and then reconnected
+    resetTransports()
+    const seen = record()
+    const timers = manualTimers()
+    connectBrowserViewSocket(seen.handlers, {
+      WebSocketImpl: FakeTransport,
+      location: origin,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+    })
+    const first = FakeTransport.instances[0]
+    first.fireOpen()
+    first.fireMessage({ v: 1, kind: 'dom', tabId: 'tab-1', seq: 42, events: [{ type: 3 }] })
+    first.fireClose()
+    timers.runNext()
+    const second = FakeTransport.instances[1]
+    second.fireOpen()
+
+    // When the new host sends its own first batch
+    second.fireMessage({ v: 1, kind: 'dom', tabId: 'tab-1', seq: 1, reset: true, events: [{ type: 2 }] })
+
+    // Then it is not mistaken for a stale batch from the old host
+    expect(seen.doms).toHaveLength(2)
+    expect(seen.doms[1]).toMatchObject({ seq: 1, reset: true })
+  })
+
+  it('host cannot start the mirror and the panel is told which tab and why', () => {
+    // Given an open socket
+    resetTransports()
+    const seen = record()
+    connectBrowserViewSocket(seen.handlers, { WebSocketImpl: FakeTransport, location: origin })
+    const transport = FakeTransport.instances[0]
+    transport.fireOpen()
+
+    // When the host reports the mirror of one tab as unavailable
+    transport.fireMessage({ v: 1, kind: 'mirror', tabId: 'tab-1', available: false, reason: 'the page forbids eval' })
+
+    // Then the panel receives the tab and the reason
+    expect(seen.mirrors).toEqual([{ tabId: 'tab-1', available: false, reason: 'the page forbids eval' }])
+  })
+
+  it('a host from after this panel sends an event kind it does not know and nothing is thrown', () => {
+    // Given an open socket
+    resetTransports()
+    const seen = record()
+    connectBrowserViewSocket(seen.handlers, { WebSocketImpl: FakeTransport, location: origin })
+    const transport = FakeTransport.instances[0]
+    transport.fireOpen()
+
+    // When an event kind from a newer contract arrives
+    expect(() => {
+      transport.fireMessage({ v: 1, kind: 'audio-stream', tabId: 'tab-1', pcm: 'AAAA' })
+    }).not.toThrow()
+
+    // Then it is dropped without reaching any handler, and the connection stays open
+    expect(seen.doms).toHaveLength(0)
+    expect(seen.frames).toHaveLength(0)
+    expect(transport.closed).toBe(false)
   })
 })

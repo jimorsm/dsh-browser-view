@@ -1,5 +1,6 @@
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots';
 import type { BrowserViewLiveTitleStore } from './live-title.ts';
+import { type BrowserViewMirrorFactory } from './mirror.ts';
 import { type BrowserViewSocket, type BrowserViewSocketHandlers } from './socket.ts';
 /** Page-side socket factory; tests inject a fake transport through it. */
 export type BrowserViewSocketFactory = (handlers: BrowserViewSocketHandlers) => BrowserViewSocket;
@@ -19,10 +20,15 @@ export type BrowserViewPanelProps = PropsLocale<'browser-view'> & Partial<Browse
         readonly protocol: string;
         readonly host: string;
     };
+    /**
+     * Builds the DOM mirror's replayer. Overridden by tests, which have no
+     * browser to replay into; the default loads rrweb lazily.
+     */
+    readonly mirrorFactory?: BrowserViewMirrorFactory;
 };
 /**
  * Render the browser view tab body.
  * @param props - composed slot props.
  * @returns the tab content.
  */
-export declare function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, location }: BrowserViewPanelProps): import("react").JSX.Element;
+export declare function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, location, mirrorFactory }: BrowserViewPanelProps): import("react").JSX.Element;

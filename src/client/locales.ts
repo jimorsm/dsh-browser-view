@@ -13,6 +13,12 @@
  * 'panel.tabs.empty' went with the always-drawn tab strip: the controlled
  * browser's chips now appear only when it holds more than one page, so there is
  * no empty strip left to caption.
+ *
+ * The lane switch needs its own words rather than one label: the control has to
+ * name what is on screen now ('panel.mode.dom' / 'panel.mode.pixels'), say what
+ * pressing it does ('panel.mode.switch'), and account for a mirror that could
+ * not start ('panel.mirror.starting' / 'panel.mirror.unavailable' - the latter
+ * is a sentence prefix, because the host's own reason is appended to it).
  */
 
 /** Simplified Chinese dictionary (key-set source of truth). */
@@ -23,9 +29,14 @@ export const zh = {
   'panel.url.empty': '还没有打开页面',
   'panel.address.label': '页面地址',
   'panel.toolbar.refresh': '刷新画面',
+  'panel.mode.dom': '文字',
+  'panel.mode.pixels': '像素',
+  'panel.mode.switch': '切换显示模式（文字镜像 / 像素画面）',
   'panel.frame.alt': 'agent 正在操作的页面画面',
   'panel.empty.title': '还没有画面',
   'panel.empty.hint': '让 agent 打开一个页面后，这里会实时显示它正在看的网页。',
+  'panel.mirror.starting': '正在建立文字镜像…',
+  'panel.mirror.unavailable': '文字镜像不可用，已切换到像素画面：',
   'panel.error.title': '浏览器视图出错',
   'panel.trace.idle': '暂无工具动作',
   'panel.status.connecting': '正在连接',
@@ -44,9 +55,14 @@ export const en: Record<BrowserViewKey, string> = {
   'panel.url.empty': 'No page open yet',
   'panel.address.label': 'Page address',
   'panel.toolbar.refresh': 'Refresh the frame',
+  'panel.mode.dom': 'Text',
+  'panel.mode.pixels': 'Pixels',
+  'panel.mode.switch': 'Switch the view mode (DOM mirror or pixel stream)',
   'panel.frame.alt': 'Live view of the page the agent is driving',
   'panel.empty.title': 'No frames yet',
   'panel.empty.hint': 'Once the agent opens a page, this tab shows the page it is looking at.',
+  'panel.mirror.starting': 'Building the DOM mirror…',
+  'panel.mirror.unavailable': 'The DOM mirror is unavailable; showing the pixel stream instead: ',
   'panel.error.title': 'Browser view error',
   'panel.trace.idle': 'No tool actions yet',
   'panel.status.connecting': 'Connecting',

@@ -16,14 +16,22 @@ export declare const BROWSER_VIEW_PLUGIN = "browser-view";
 export declare const BROWSER_VIEW_PARTS: {
     /** The tab body the sidebar mounts in its content area. */
     readonly panel: "panel";
-    /** Top chrome row: address display, connection state, refresh. */
+    /** Top chrome row: address display, connection state, lane switch, refresh. */
     readonly toolbar: "toolbar";
     /** The read-only address display of the streamed page. */
     readonly address: "address";
+    /** The lane switch: DOM mirror or pixel stream. */
+    readonly mode: "mode";
     /** The controlled browser's tab chips; drawn only when it holds several. */
     readonly tabs: "tabs";
     /** The live frame image. */
     readonly frame: "frame";
+    /** The replayed DOM mirror of the streamed page. */
+    readonly mirror: "mirror";
+    /** Why the mirror is not running and the pixel lane took over. */
+    readonly mirrorNotice: "mirror-notice";
+    /** Placeholder shown while the mirror is being armed. */
+    readonly mirrorStarting: "mirror-starting";
     /** Bottom action trace. */
     readonly trace: "trace";
     /** Connection state marker in the toolbar. */

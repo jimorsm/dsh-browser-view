@@ -17,6 +17,15 @@
  * changes, and action traces go to every attached panel. The service never
  * lets one dead socket break the fan-out — a throwing send drops that sink.
  *
+ * Lanes. A panel declares which lane it renders (`mode`): the DOM mirror, whose
+ * events come from src/core/mirror.ts, or the screencast. The declaration is
+ * per sink, so one person can watch pixels while another watches DOM, and it is
+ * what keeps a panel from before the mirror existed on exactly the frames it
+ * always got. The recorder runs only while some visible sink asks for it, and
+ * the screencast runs only while some visible sink still needs pixels — which
+ * includes a mirror that has not delivered its first snapshot yet, so switching
+ * lanes never shows an empty stage.
+ *
  * @module @jimorsm/dsh-client-ui-browser-view/host/service
  */
 
@@ -26,6 +35,8 @@ import type { CdpTransport } from '../core/cdp.ts'
 import { ChromeProcess } from '../core/chrome.ts'
 import { resolveBrowserHandle, type ResolvedBrowser } from '../core/browser.ts'
 import { TabManager, type ScreencastFrame } from '../core/tabs.ts'
+import { DomMirror, type MirrorRecording } from '../core/mirror.ts'
+import { readMirrorSource } from './mirror-source.ts'
 import { buildSnapshot, type SnapshotResult } from '../core/snapshot.ts'
 import { DOCUMENT_TEXT_EXPRESSION, isAuthChallengeText, isLoopbackTarget } from './auth.ts'
 import {
@@ -40,6 +51,8 @@ import {
 import {
   DEFAULT_CAPTURE_MAX,
   DEFAULT_FRAME_FORMAT,
+  DEFAULT_VIEW_LANE,
+  type BrowserViewLane,
   type FrameImageFormat,
   DEFAULT_JPEG_QUALITY,
   DEFAULT_VIEWPORT,
@@ -70,12 +83,40 @@ const INTERACTIVE_FRAME_INTERVAL_MS = 33
 /** How long one input gesture keeps the interactive frame rate. */
 const INTERACTIVE_WINDOW_MS = 3_000
 
+/** rrweb's FullSnapshot event type; a fresh replayer can start from one. */
+const RRWEB_FULL_SNAPSHOT = 2
+
+/** The checkpoint type of one rrweb event, when it carries one. */
+function eventTypeOf(event: unknown): number | undefined {
+  if (typeof event !== 'object' || event === null) return undefined
+  const type = (event as Record<string, unknown>).type
+  return typeof type === 'number' ? type : undefined
+}
+
 /** One attached panel socket as the service sees it. */
 export interface BrowserViewSink {
   /** Deliver one event; a throw means the sink is gone. */
   send(event: BrowserViewEvent): void
   /** Close the underlying transport. */
   close(): void
+}
+
+/**
+ * What one panel asked to render, and how much of the mirror it already has.
+ *
+ * The cursor is per sink because the mirror's traffic is per sink: a panel that
+ * attaches late, or comes back from being hidden, gets the recording from its
+ * latest checkpoint instead of the increments it never saw.
+ */
+interface SinkLane {
+  /** Lane the panel asked for. Absent means {@link DEFAULT_VIEW_LANE}. */
+  lane: BrowserViewLane
+  /** Tab the cursor describes. */
+  tabId: string | undefined
+  /** Mirror generation the panel's replayer was built from, if any. */
+  generation: number | undefined
+  /** Events of that generation the panel already received. */
+  offset: number
 }
 
 /** What the route layer needs from the service; tests stub this instead. */
@@ -159,6 +200,12 @@ export interface BrowserViewServiceOptions {
   createRelay?: () => FrameRelay
   /** Clock for action traces. @default Date.now */
   now?: () => number
+  /**
+   * Reads the bundled rrweb recorder the mirror injects. Injected by tests,
+   * which have no built artifact; the production value reads the copy that
+   * ships beside the host half ({@link readMirrorSource}).
+   */
+  mirrorSource?: () => string
   /**
    * Mints the process launch-token URL for one clean URL, or returns
    * undefined when the host mounts no such seam. Resolved per navigation by
@@ -247,6 +294,7 @@ export class BrowserViewService implements BrowserViewBackend {
   private readonly openSession: NonNullable<BrowserViewServiceOptions['openSession']>
   private readonly createRelay: () => FrameRelay
   private readonly authenticatedUrl: BrowserViewServiceOptions['authenticatedUrl']
+  private readonly mirrorSource: () => string
   private readonly sinks = new Set<BrowserViewSink>()
   /** Per-sink WebRTC frame relay; a sink with an open relay receives frames there. */
   private readonly relays = new Map<BrowserViewSink, FrameRelay>()
@@ -256,6 +304,19 @@ export class BrowserViewService implements BrowserViewBackend {
    * encoded or sent for them while they are in here.
    */
   private readonly paused = new Set<BrowserViewSink>()
+  /** Per-sink lane choice and mirror cursor. */
+  private readonly lanes = new Map<BrowserViewSink, SinkLane>()
+  /**
+   * Tabs whose mirror failed most recently. A failed injection is remembered so
+   * a panel that keeps its socket open does not make the host retry the same
+   * doomed injection on every state change; asking for the lane again - the one
+   * gesture that could plausibly have changed the page - clears it.
+   */
+  private readonly mirrorFailures = new Map<string, string>()
+  /** The tab the recorder is running for, if any; one mirror at a time. */
+  private mirroredTabId: string | null = null
+  /** Batch counter for `dom` events; monotonic per service, not per tab. */
+  private domSeq = 0
   /**
    * When the last frame reached any panel, for the frame-interval budget.
    * Starts at the beginning of time, not at zero: a clock whose origin is zero
@@ -273,6 +334,8 @@ export class BrowserViewService implements BrowserViewBackend {
    */
   private readonly authTopUpSpent = new Set<string>()
   private session: BrowserSession | undefined
+  /** The DOM mirror over the running session; absent until one starts. */
+  private mirror: DomMirror | undefined
   /**
    * The tab the attached panels watch. Kept beside the tab manager instead of
    * read from it because "the page the panel shows" and "the page most recently
@@ -305,6 +368,7 @@ export class BrowserViewService implements BrowserViewBackend {
     this.createRelay = options.createRelay ?? (() => new RtcFrameRelay())
     this.openSession = options.openSession ?? openDefaultSession
     this.authenticatedUrl = options.authenticatedUrl
+    this.mirrorSource = options.mirrorSource ?? readMirrorSource
   }
 
   /** Whether a browser is currently running. */
@@ -330,16 +394,21 @@ export class BrowserViewService implements BrowserViewBackend {
    */
   attach(sink: BrowserViewSink): () => void {
     this.sinks.add(sink)
+    // A panel that never asked for a lane renders pixels, which is what every
+    // panel built before the mirror existed does.
+    this.lanes.set(sink, { lane: DEFAULT_VIEW_LANE, tabId: undefined, generation: undefined, offset: 0 })
     // The hello frame is the panel's first paint: it carries the current tabs
     // so a reconnecting panel does not have to ask.
     sink.send({ v: 1, kind: 'hello', state: this.state() })
-    void this.startStreaming()
+    void this.syncLanes()
     return () => {
       this.sinks.delete(sink)
       this.paused.delete(sink)
+      this.lanes.delete(sink)
       this.relays.get(sink)?.dispose()
       this.relays.delete(sink)
       if (this.activeSinks().length === 0) void this.stopStreaming()
+      void this.syncMirror()
     }
   }
 
@@ -358,7 +427,7 @@ export class BrowserViewService implements BrowserViewBackend {
           // blank page instead of the one the agent is driving.
           this.followPanelSession(command.sessionId)
           sink.send({ v: 1, kind: 'hello', state: this.state() })
-          await this.startStreaming()
+          await this.syncLanes()
           return
         }
         case 'select-tab': {
@@ -395,6 +464,31 @@ export class BrowserViewService implements BrowserViewBackend {
           await tabs.dispatchInput(tabId, command.input)
           return
         }
+        case 'mode': {
+          // One panel picking a lane never moves another's: the choice is what
+          // this socket renders, and the recorder is shared only because the
+          // page is.
+          const lane = this.laneOf(sink)
+          lane.lane = command.mode
+          lane.tabId = undefined
+          lane.generation = undefined
+          lane.offset = 0
+          const tabId = this.displayedOrDefault()
+          if (command.mode === 'dom') {
+            // Asking again is the one gesture that can change the outcome: a
+            // page that failed to accept the recorder a moment ago may accept
+            // it now, and the person just pressed the switch.
+            if (tabId !== null) this.mirrorFailures.delete(tabId)
+            await this.syncLanes()
+          } else {
+            await this.syncLanes()
+            // The mirror is not a fallback for a picture: a panel that just
+            // switched has none, and waiting for the compositor to move could
+            // take as long as the page stays still.
+            if (tabId !== null) await this.session?.tabs.refreshFrame(tabId).catch(() => undefined)
+          }
+          return
+        }
         case 'stream': {
           // A panel whose tab left the screen says so; the host stops paying
           // for a picture nobody sees. The last panel to leave stops the
@@ -402,16 +496,24 @@ export class BrowserViewService implements BrowserViewBackend {
           const others = [...this.sinks].filter(candidate => candidate !== sink && !this.paused.has(candidate))
           if (command.enabled) {
             this.paused.delete(sink)
-            void this.startStreaming()
-            // Fresh picture immediately: the panel may have been paused for
-            // minutes and its last frame is stale.
+            await this.syncLanes()
             const session = this.session
             const tabId = this.displayedOrDefault()
             if (session !== undefined && tabId !== null) {
-              await session.tabs.refreshFrame(tabId).catch(() => undefined)
+              // A panel that was hidden missed whatever the mirror did meanwhile,
+              // so its replayer is behind: hand it the recording from its
+              // checkpoint again rather than the increments it never saw.
+              if (this.needsPixels(sink)) {
+                await session.tabs.refreshFrame(tabId).catch(() => undefined)
+              } else {
+                this.deliverRecording(sink, tabId)
+              }
             }
           } else {
             this.paused.add(sink)
+            // A paused panel must stop being the reason the recorder runs:
+            // hidden is the one state where nothing of this tab is watched.
+            void this.syncMirror()
             if (others.length === 0) await this.stopStreaming()
           }
           return
@@ -452,6 +554,10 @@ export class BrowserViewService implements BrowserViewBackend {
     for (const [sessionId, boundTab] of [...this.bindings]) {
       if (boundTab === tabId) this.bindings.delete(sessionId)
     }
+    // The recorder dies with its target: forgetting it here is what keeps a
+    // closed tab from holding a buffer nobody can ever read again.
+    this.mirrorFailures.delete(tabId)
+    await this.stopMirror(tabId)
     await tabs.closeTab(tabId)
     if (wasDisplayed) {
       // The pinned tab is gone, so there is nothing left to hold: fall back to
@@ -881,6 +987,9 @@ export class BrowserViewService implements BrowserViewBackend {
     for (const sink of [...this.sinks]) {
       // A paused panel is not looking: it costs no bytes and no decoding.
       if (event.kind === 'frame' && this.paused.has(sink)) continue
+      // Neither is a panel that is already rendering the mirror: the picture is
+      // exactly the cost the DOM lane exists to remove.
+      if (event.kind === 'frame' && !this.needsPixels(sink)) continue
       try {
         // A sink with an open relay takes its frames there, as binary with no
         // base64 tax; everything else still travels the WebSocket.
@@ -899,8 +1008,240 @@ export class BrowserViewService implements BrowserViewBackend {
         sink.send(event)
       } catch {
         this.sinks.delete(sink)
+        this.lanes.delete(sink)
       }
     }
+  }
+
+  /**
+   * Whether one panel still needs the pixel lane: it asked for pixels, or it
+   * asked for the mirror and has no recording to draw yet. The second half is
+   * what keeps the switch from showing a blank stage while the recorder arms.
+   * @param sink - the panel.
+   * @returns true when frames must keep flowing to it.
+   */
+  private needsPixels(sink: BrowserViewSink): boolean {
+    const lane = this.lanes.get(sink)
+    return lane === undefined || lane.lane !== 'dom' || lane.generation === undefined
+  }
+
+  /** One panel's lane record, created on first use. */
+  private laneOf(sink: BrowserViewSink): SinkLane {
+    let lane = this.lanes.get(sink)
+    if (lane === undefined) {
+      lane = { lane: DEFAULT_VIEW_LANE, tabId: undefined, generation: undefined, offset: 0 }
+      this.lanes.set(sink, lane)
+    }
+    return lane
+  }
+
+  /**
+   * Bring both lanes in line with what the visible panels asked for.
+   *
+   * One place, called after every event that can change the answer - a panel
+   * attaching, hiding, showing or switching, the watched tab moving, a tab
+   * closing - so "the recorder runs only while somebody watches" stays a
+   * property of the service instead of a rule each call site remembers.
+   */
+  private async syncLanes(): Promise<void> {
+    await this.syncMirror()
+    await this.syncStreaming()
+  }
+
+  /**
+   * Start or stop the recorder to match the visible panels' lanes. The mirror
+   * follows the watched tab, exactly like the screencast: a background page
+   * nobody renders must not keep a recorder running.
+   */
+  private async syncMirror(): Promise<void> {
+    const session = this.session
+    if (session === undefined) return
+    const tabId = this.displayedOrDefault()
+    const wanted = tabId !== null
+      && this.activeSinks().some(sink => this.lanes.get(sink)?.lane === 'dom')
+    const target = wanted ? tabId : null
+    if (this.mirroredTabId !== null && this.mirroredTabId !== target) {
+      const previous = this.mirroredTabId
+      this.mirroredTabId = null
+      await this.stopMirror(previous)
+    }
+    if (target !== null && this.mirroredTabId !== target) {
+      this.mirroredTabId = target
+      await this.startMirror(target)
+    }
+  }
+
+  /**
+   * Arm the recorder in one tab.
+   *
+   * Every failure ends in {@link failMirror} rather than in a rejected command:
+   * the panel did not ask a question, it asked for a lane, and the honest
+   * answer is the other lane plus the reason. A tab whose injection is known to
+   * fail is not retried until somebody asks for the lane again.
+   * @param tabId - the tab to mirror.
+   */
+  private async startMirror(tabId: string): Promise<void> {
+    const session = this.session
+    const mirror = this.mirror
+    if (session === undefined || mirror === undefined) return
+    if (this.mirrorFailures.has(tabId)) return
+    if (!session.tabs.has(tabId)) return
+    try {
+      await mirror.start(tabId, session.tabs.sessionOf(tabId))
+    } catch (error) {
+      this.failMirror(tabId, error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  /**
+   * Stop the recorder in one tab; a tab that never recorded is fine.
+   *
+   * Every cursor pointing at that tab is dropped with it: the recording those
+   * cursors describe no longer exists, and a panel left holding a generation
+   * would never be told to rebuild when the recorder arms again.
+   */
+  private async stopMirror(tabId: string | null): Promise<void> {
+    if (tabId === null) return
+    await this.mirror?.stop(tabId).catch(() => undefined)
+    for (const lane of this.lanes.values()) {
+      if (lane.tabId !== tabId) continue
+      lane.tabId = undefined
+      lane.generation = undefined
+      lane.offset = 0
+    }
+  }
+
+  /**
+   * Tell the panels watching one tab that its mirror is gone, and move them to
+   * the pixel lane.
+   *
+   * The lane is changed here rather than left to the panel because the host is
+   * the side that knows the mirror is dead: a panel moved to pixels starts
+   * receiving frames on the next broadcast, and the reason travels with the
+   * move so the viewer is never left with an empty stage and no explanation.
+   * @param tabId - the tab whose mirror failed.
+   * @param reason - what to show the person watching.
+   */
+  private failMirror(tabId: string, reason: string): void {
+    this.mirrorFailures.set(tabId, reason)
+    if (this.mirroredTabId === tabId) this.mirroredTabId = null
+    let moved = false
+    for (const sink of [...this.sinks]) {
+      const lane = this.lanes.get(sink)
+      if (lane === undefined || lane.lane !== 'dom') continue
+      // A panel rendering some other tab's mirror is not affected by this one.
+      if (lane.tabId !== undefined && lane.tabId !== tabId) continue
+      lane.lane = 'pixels'
+      lane.tabId = undefined
+      lane.generation = undefined
+      lane.offset = 0
+      moved = true
+      this.sendTo(sink, { v: 1, kind: 'mirror', tabId, available: false, reason })
+    }
+    if (moved) void this.syncStreaming()
+  }
+
+  /** Start or stop the screencast to match what the visible panels need. */
+  private async syncStreaming(): Promise<void> {
+    if (this.activeSinks().some(sink => this.needsPixels(sink))) await this.startStreaming()
+    else await this.stopStreaming()
+  }
+
+  /** Deliver one event to one sink, dropping it if the socket is gone. */
+  private sendTo(sink: BrowserViewSink, event: BrowserViewEvent): void {
+    try {
+      sink.send(event)
+    } catch {
+      this.sinks.delete(sink)
+      this.lanes.delete(sink)
+    }
+  }
+
+  /**
+   * Hand the tabs a mirror event changed, filtered and cut for each panel.
+   *
+   * The cut is per sink because a recording is a stream, not a value: a panel
+   * whose cursor is behind gets the events it missed, and a panel whose
+   * generation is stale gets the whole recording with `reset` set, which is
+   * what its replayer needs to rebuild from a checkpoint.
+   * @param tabId - the tab whose recording changed.
+   */
+  private broadcastDom(tabId: string): void {
+    const recording = this.mirror?.recording(tabId)
+    if (recording === undefined) return
+    let becameReady = false
+    for (const sink of [...this.sinks]) {
+      if (this.paused.has(sink)) continue
+      const lane = this.lanes.get(sink)
+      if (lane === undefined || lane.lane !== 'dom') continue
+      if (this.deliver(sink, lane, tabId, recording)) becameReady = true
+    }
+    // The first recording a panel can draw is the moment it stops needing
+    // frames; everything before it kept the pixel lane warm.
+    if (becameReady) void this.syncStreaming()
+  }
+
+  /**
+   * Send one panel the part of a recording it does not have yet.
+   * @returns whether this delivery is the panel's first drawable recording.
+   */
+  private deliver(sink: BrowserViewSink, lane: SinkLane, tabId: string, recording: MirrorRecording): boolean {
+    if (recording.events.length === 0) return false
+    if (lane.tabId !== tabId) {
+      lane.tabId = tabId
+      lane.generation = undefined
+      lane.offset = 0
+    }
+    const first = lane.generation === undefined
+    // A replayer cannot draw an incremental stream, and rrweb's recorder emits
+    // its Meta event a beat before the snapshot that goes with it. Waiting for
+    // the snapshot is what keeps a panel's first batch drawable instead of
+    // hiding the pixel stage behind an empty frame.
+    if (first && !recording.events.some(event => eventTypeOf(event) === RRWEB_FULL_SNAPSHOT)) return false
+    if (lane.generation !== recording.generation) {
+      lane.generation = recording.generation
+      lane.offset = recording.events.length
+      this.domSeq += 1
+      this.sendTo(sink, {
+        v: 1,
+        kind: 'dom',
+        tabId,
+        seq: this.domSeq,
+        reset: true,
+        events: [...recording.events],
+      })
+      return first
+    }
+    const fresh = recording.events.slice(lane.offset)
+    if (fresh.length === 0) return false
+    lane.offset = recording.events.length
+    this.domSeq += 1
+    this.sendTo(sink, { v: 1, kind: 'dom', tabId, seq: this.domSeq, events: fresh })
+    return false
+  }
+
+  /**
+   * Re-send a panel the recording from its checkpoint, for a panel that was
+   * hidden while the page moved on.
+   * @param sink - the panel to catch up.
+   * @param tabId - the tab whose recording it should draw.
+   */
+  private deliverRecording(sink: BrowserViewSink, tabId: string): void {
+    const recording = this.mirror?.recording(tabId)
+    const lane = this.lanes.get(sink)
+    if (recording === undefined || lane === undefined || recording.events.length === 0) return
+    lane.tabId = tabId
+    lane.generation = recording.generation
+    lane.offset = recording.events.length
+    this.domSeq += 1
+    this.sendTo(sink, {
+      v: 1,
+      kind: 'dom',
+      tabId,
+      seq: this.domSeq,
+      reset: true,
+      events: [...recording.events],
+    })
   }
 
   /**
@@ -930,6 +1271,9 @@ export class BrowserViewService implements BrowserViewBackend {
     this.sinks.clear()
     for (const relay of this.relays.values()) relay.dispose()
     this.relays.clear()
+    this.lanes.clear()
+    this.mirrorFailures.clear()
+    this.mirroredTabId = null
     for (const sink of sinks) {
       try {
         sink.close()
@@ -937,6 +1281,12 @@ export class BrowserViewService implements BrowserViewBackend {
         // A socket that is already gone needs no second close.
       }
     }
+    // The recorder is stopped while the browser can still be talked to: a
+    // recording left running in a page nobody will ever look at again is the
+    // one leak this ordering prevents.
+    const mirror = this.mirror
+    this.mirror = undefined
+    if (mirror !== undefined) await mirror.dispose().catch(() => undefined)
     const session = this.session
     this.session = undefined
     this.bindings.clear()
@@ -978,6 +1328,15 @@ export class BrowserViewService implements BrowserViewBackend {
     this.displayedTabId = null
     this.selectionPinned = false
     this.lastError = reason
+    this.lanes.clear()
+    this.mirrorFailures.clear()
+    this.mirroredTabId = null
+    // The mirror rode this transport, so it dies with it. Its own dispose is
+    // fire-and-forget: the socket is already gone, and every stop it attempts
+    // is best-effort by design.
+    const mirror = this.mirror
+    this.mirror = undefined
+    void mirror?.dispose().catch(() => undefined)
     void Promise.resolve()
       .then(() => session.dispose())
       .catch(() => undefined)
@@ -1004,6 +1363,15 @@ export class BrowserViewService implements BrowserViewBackend {
         onTabsChanged: () => { this.broadcast({ v: 1, kind: 'state', state: this.state() }) },
       })
       this.session = session
+      // The mirror is built over this session's transport and resolves tabs
+      // through the tab manager's own page sessions: one attach per tab, the
+      // one the console ring and the network table already use.
+      this.mirror = new DomMirror({
+        transport: session.transport,
+        source: this.mirrorSource,
+        onEvent: tabId => { this.broadcastDom(tabId) },
+        onFailure: (tabId, reason) => { this.failMirror(tabId, reason) },
+      })
       // A browser can die while it is idle: a crashed renderer, an operator
       // killing it, the machine reclaiming memory. Forget the session the moment
       // its connection ends, so the next call starts a fresh browser instead of
@@ -1063,6 +1431,7 @@ export class BrowserViewService implements BrowserViewBackend {
       // Nothing moved, but the caller may still owe the panels a state frame
       // (a tab's url changed, for instance).
       this.broadcast({ v: 1, kind: 'state', state: this.state() })
+      void this.syncMirror()
       return
     }
     const session = this.session
@@ -1074,6 +1443,9 @@ export class BrowserViewService implements BrowserViewBackend {
       if (previous !== null) void session.tabs.stopScreencast(previous).catch(() => undefined)
       if (tabId !== null) void session.tabs.startScreencast(tabId).catch(() => undefined)
     }
+    // The recorder follows the same rule as the screencast: the watched tab
+    // only, and only while somebody visible is rendering the mirror.
+    void this.syncMirror()
     this.broadcast({ v: 1, kind: 'state', state: this.state() })
   }
 

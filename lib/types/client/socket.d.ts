@@ -20,6 +20,26 @@ export interface BrowserViewFrame {
     /** Base64 image bytes, no data: prefix. */
     readonly data: string;
 }
+/** One decoded batch of mirror events, exactly as the panel needs it. */
+export interface BrowserViewDomBatch {
+    /** Tab the recording belongs to. */
+    readonly tabId: string;
+    /** Host-side monotonic counter over mirror batches. */
+    readonly seq: number;
+    /** Whether `events` start a recording rather than continue one. */
+    readonly reset: boolean;
+    /** rrweb recording events, in recording order. */
+    readonly events: ReadonlyArray<unknown>;
+}
+/** Whether the host's DOM mirror is running for one tab. */
+export interface BrowserViewMirrorStatus {
+    /** Tab the status describes. */
+    readonly tabId: string;
+    /** Whether the mirror is running. */
+    readonly available: boolean;
+    /** Why it is not, when the host reported a failure. */
+    readonly reason?: string;
+}
 /** Callbacks the panel installs on a connection. */
 export interface BrowserViewSocketHandlers {
     /** Connection phase changed. */
@@ -28,6 +48,10 @@ export interface BrowserViewSocketHandlers {
     onState(state: BrowserPanelState): void;
     /** A fresh frame arrived, already filtered for staleness. */
     onFrame(frame: BrowserViewFrame): void;
+    /** A batch of DOM mirror events arrived, already filtered for staleness. */
+    onDom?(batch: BrowserViewDomBatch): void;
+    /** The host reported whether the DOM mirror runs for a tab. */
+    onMirror?(status: BrowserViewMirrorStatus): void;
     /** The agent performed one tool action. */
     onAction(trace: BrowserActionTrace): void;
     /** The host reported a failure the panel must show instead of a frame. */

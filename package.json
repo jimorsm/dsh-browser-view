@@ -36,12 +36,13 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && tsdown",
+    "build": "tsc -p tsconfig.build.json && tsdown && node build/copy-mirror.mjs",
     "watch": "tsdown --watch",
     "test": "vitest run",
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
+    "rrweb": "2.2.0",
     "werift": "0.25.2",
     "ws": "^8.18.0"
   },
