@@ -54,6 +54,13 @@ export interface CdpTransport {
    */
   on(method: string, handler: CdpEventListener): () => void
   /** Drop the socket; every pending round-trip rejects. */
+  /**
+   * Subscribe to the connection ending; the listener runs at most once, and a
+   * client that already ended runs it immediately.
+   * @param listener - called when the socket closes or fails.
+   * @returns an unsubscribe function.
+   */
+  onClose(listener: () => void): () => void
   close(): void
 }
 
@@ -81,6 +88,8 @@ export class CdpClient implements CdpTransport {
   private readonly listeners = new Map<string, Set<CdpEventListener>>()
   private nextId = 1
   private closedReason: string | undefined
+  /** Listeners waiting for the connection to end; fired at most once. */
+  private readonly closeListeners = new Set<() => void>()
 
   private constructor(socket: WebSocket, timeoutMs: number) {
     this.socket = socket
@@ -175,6 +184,18 @@ export class CdpClient implements CdpTransport {
   }
 
   /** Drop the socket and reject every in-flight command. */
+  /**
+   * Run `listener` when the connection ends. A client that already ended runs it
+   * immediately, so a subscriber never waits for an event that cannot arrive.
+   * @param listener - callback for the loss of the connection.
+   * @returns an unsubscribe function.
+   */
+  onClose(listener: () => void): () => void {
+    if (this.closedReason === undefined) this.closeListeners.add(listener)
+    else listener()
+    return () => { this.closeListeners.delete(listener) }
+  }
+
   close(): void {
     if (this.closedReason !== undefined) return
     this.closedReason = 'the DevTools client was closed'
@@ -232,7 +253,21 @@ export class CdpClient implements CdpTransport {
 
   /** Reject every in-flight command with one reason. */
   private failAll(reason: string): void {
+    const first = this.closedReason === undefined
     this.closedReason ??= reason
+    if (first) {
+      // The connection is gone for good: every close listener runs exactly once,
+      // and a listener that throws must not hide the loss from the others.
+      const listeners = [...this.closeListeners]
+      this.closeListeners.clear()
+      for (const listener of listeners) {
+        try {
+          listener()
+        } catch {
+          // Reported through the owning session's own state, not through here.
+        }
+      }
+    }
     for (const [id, call] of [...this.pending]) {
       this.pending.delete(id)
       clearTimeout(call.timer)

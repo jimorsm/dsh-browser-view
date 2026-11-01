@@ -455,6 +455,13 @@ export declare class BrowserViewService implements BrowserViewBackend {
     private transport;
     /** Resolve the live session or start one. */
     private requireTabs;
+    /**
+     * Drop a session whose connection ended, so the next call starts a new browser.
+     * The panels are told, because a viewer that keeps showing the last frame of a
+     * dead browser is worse than one that says the connection dropped.
+     * @param reason - what the panels are told happened.
+     */
+    private loseSession;
     /** Resolve the live session, starting the browser on first use. */
     private requireSession;
     /** Start the browser once, recording failures for the panel. */

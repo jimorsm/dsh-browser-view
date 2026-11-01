@@ -44,6 +44,13 @@ export interface CdpTransport {
      */
     on(method: string, handler: CdpEventListener): () => void;
     /** Drop the socket; every pending round-trip rejects. */
+    /**
+     * Subscribe to the connection ending; the listener runs at most once, and a
+     * client that already ended runs it immediately.
+     * @param listener - called when the socket closes or fails.
+     * @returns an unsubscribe function.
+     */
+    onClose(listener: () => void): () => void;
     close(): void;
 }
 /** One protocol event delivery. */
@@ -60,6 +67,8 @@ export declare class CdpClient implements CdpTransport {
     private readonly listeners;
     private nextId;
     private closedReason;
+    /** Listeners waiting for the connection to end; fired at most once. */
+    private readonly closeListeners;
     private constructor();
     /**
      * Open a client against an already-discovered DevTools endpoint.
@@ -87,6 +96,13 @@ export declare class CdpClient implements CdpTransport {
      */
     on(method: string, handler: CdpEventListener): () => void;
     /** Drop the socket and reject every in-flight command. */
+    /**
+     * Run `listener` when the connection ends. A client that already ended runs it
+     * immediately, so a subscriber never waits for an event that cannot arrive.
+     * @param listener - callback for the loss of the connection.
+     * @returns an unsubscribe function.
+     */
+    onClose(listener: () => void): () => void;
     close(): void;
     /** Route one decoded frame to the pending map or the event listeners. */
     private handleMessage;
