@@ -33,6 +33,8 @@ export class FakeTransport implements CdpTransport {
   readonly listeners = new Map<string, Set<CdpEventListener>>()
   /** Set by `close`. */
   closed = false
+  /** Listeners waiting for the connection to end. */
+  private readonly closeListeners = new Set<() => void>()
   /** Called synchronously for every command, before it resolves. */
   onSend: ((call: RecordedCall) => void) | undefined
 
@@ -63,9 +65,24 @@ export class FakeTransport implements CdpTransport {
     return () => { set?.delete(handler) }
   }
 
-  /** Mark the transport closed. */
+  /**
+   * Run `listener` when the transport closes, as the real client does for a
+   * dropped DevTools socket; an already-closed transport runs it immediately.
+   * @param listener - callback for the loss of the connection.
+   * @returns an unsubscribe function.
+   */
+  onClose(listener: () => void): () => void {
+    if (this.closed) listener()
+    else this.closeListeners.add(listener)
+    return () => { this.closeListeners.delete(listener) }
+  }
+
+  /** Mark the transport closed and tell everyone waiting on it. */
   close(): void {
     this.closed = true
+    const listeners = [...this.closeListeners]
+    this.closeListeners.clear()
+    for (const listener of listeners) listener()
   }
 
   /** Deliver one protocol event to its subscribers. */

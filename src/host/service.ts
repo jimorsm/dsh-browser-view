@@ -962,6 +962,28 @@ export class BrowserViewService implements BrowserViewBackend {
     return (await this.requireSession()).tabs
   }
 
+  /**
+   * Drop a session whose connection ended, so the next call starts a new browser.
+   * The panels are told, because a viewer that keeps showing the last frame of a
+   * dead browser is worse than one that says the connection dropped.
+   * @param reason - what the panels are told happened.
+   */
+  private loseSession(reason: string): void {
+    const session = this.session
+    if (session === undefined) return
+    this.session = undefined
+    this.opening = undefined
+    this.openingTab = undefined
+    this.bindings.clear()
+    this.displayedTabId = null
+    this.selectionPinned = false
+    this.lastError = reason
+    void Promise.resolve()
+      .then(() => session.dispose())
+      .catch(() => undefined)
+    this.broadcast({ v: 1, kind: 'state', state: this.state() })
+  }
+
   /** Resolve the live session, starting the browser on first use. */
   private async requireSession(): Promise<BrowserSession> {
     if (this.disposed) throw new Error('the browser view service is disposed')
@@ -982,6 +1004,11 @@ export class BrowserViewService implements BrowserViewBackend {
         onTabsChanged: () => { this.broadcast({ v: 1, kind: 'state', state: this.state() }) },
       })
       this.session = session
+      // A browser can die while it is idle: a crashed renderer, an operator
+      // killing it, the machine reclaiming memory. Forget the session the moment
+      // its connection ends, so the next call starts a fresh browser instead of
+      // failing forever against a corpse.
+      session.transport.onClose(() => { this.loseSession('the browser connection dropped') })
       this.lastError = undefined
       this.broadcast({ v: 1, kind: 'state', state: this.state() })
       return session
