@@ -14,7 +14,7 @@ This package is an external plugin for DeepSeek Harness (DSH), structured as a c
 
 ## What it does
 
-- **A live tab, not a screenshot poll**: the page is mirrored as live DOM by default (rrweb's recorder in the page, rrweb's replayer in the panel), so text stays crisp and traffic is event-sized; the pixel lane (`Page.startScreencast`) is one click away and is what a `<video>`, a canvas or native UI needs. The tab shows the active page, its URL and title, and what the agent last did.
+- **A live tab, not a screenshot poll**: the panel draws the page three ways and you pick: pixel frames (`Page.startScreencast`, the default, and the fallback for the other two), a live DOM mirror (rrweb's recorder in the page, rrweb's replayer in the panel, crisp text and event-sized traffic) and a tab capture (the tab's own surface recorded to VP8 and played with MSE, which is the lane with a real picture for a cross-origin `<video>`). The tab shows the active page, its URL and title, and what the agent last did.
 - **Eleven agent tools**: `browser_navigate`, `browser_click`, `browser_type`, `browser_press`, `browser_scroll`, `browser_snapshot`, `browser_screenshot`, `browser_console`, `browser_network`, `browser_tabs`, `browser_close` (closes only the tabs this session opened).
 - **Evidence in the conversation**: every `browser_screenshot` result carries the image, so the transcript keeps the picture the agent acted on instead of only a sentence about it.
 - **One dedicated browser**: the plugin launches its own Chromium with a throwaway profile. It never attaches to a browser you are signed into unless you opt in with `DSH_BROWSER_VIEW_ATTACH_PORT` (see Security model).
@@ -45,25 +45,26 @@ Bandwidth is designed for "look when you need to, step in when you must", not fo
 | Frame budget | At most about 15 fps while nobody interacts, opened to about 30 fps for three seconds after any input |
 | Invisible means stopped | A collapsed sidebar, another chip in front, or a hidden browser tab tells the host; the **last** watching panel leaving stops the screencast outright - nothing is captured, encoded or sent - and returning restores it with one fresh frame |
 
-## Two lanes: the DOM mirror and the pixels
+## Three lanes: pixels, the DOM mirror and the tab capture
 
-The panel renders the page **twice over**, and you choose which:
+The panel can render the page **three ways**, and you choose which:
 
 | Lane | How it works | What it is for |
 | --- | --- | --- |
-| DOM mirror (default) | The host injects rrweb's recorder into the tab (`Page.addScriptToEvaluateOnNewDocument` for future documents, `Runtime.evaluate` for the loaded one), records each mutation and streams it to the panel, which replays it with rrweb's own replayer in live mode | Text and UI pages: crisp at any panel width, and traffic proportional to what changed rather than to how often the page repaints |
-| Pixel stream | CDP `Page.startScreencast` frames, exactly as before | `<video>`, canvas, native UI and DRM - anything a DOM cannot express - and the automatic fallback |
+| Pixel stream (default) | CDP `Page.startScreencast` frames, exactly as before | Anything at all - `<video>`, canvas, native UI, DRM - and the automatic fallback of the other two lanes |
+| DOM mirror | The host injects rrweb's recorder into the tab (`Page.addScriptToEvaluateOnNewDocument` for future documents, `Runtime.evaluate` for the loaded one), records each mutation and streams it to the panel, which replays it with rrweb's own replayer in live mode | Text and UI pages: crisp at any panel width, and traffic proportional to what changed rather than to how often the page repaints |
+| Tab capture | Chromium is launched with `--auto-select-tab-capture-source-by-title=<sentinel>`, `--use-fake-ui-for-media-stream` and `--enable-usermedia-screen-capturing`; right before capturing, the host renames the watched tab to the sentinel (the flag matches the title *at capture time*) and asks the page for `getDisplayMedia({ video: { displaySurface: 'browser' }, audio: false, preferCurrentTab: true })`; the page forwards `MediaRecorder` chunks (`video/webm;codecs=vp8`, ~1.5 Mbps, 200 ms slices) over a `Runtime.addBinding` binding and the panel plays them with MSE | A real *picture* of cross-origin media. A DOM mirror has an element where a `<video>` is and no pixels in it, and element-level `captureStream()` throws `SecurityError` for a cross-origin CDN - which is where a page's media almost always lives. Tab capture goes through the browser's own surface, so the origin of the media never enters into it |
 
-The switch sits in the toolbar. The mirror is **read-only**: a click on a replayed node is not mapped back to a CDP action, because rrweb renders into its own iframe whose nodes are a reconstruction rather than the page. Input stays on the pixel lane.
+The switch sits in the toolbar and names the lane currently on screen; pressing it cycles pixels → mirror → capture. The mirror and the capture are both **read-only**: a click on a replayed node or on the captured video is not mapped back to a CDP action, because neither is the page's own element tree. Input stays on the pixel lane.
 
-Two things are deliberate about the mirror's cost:
+Two things are deliberate about the two non-pixel lanes' cost:
 
-- **It only runs while somebody watches.** The recorder is armed when a visible panel asks for that lane and stopped when the last one stops asking (or hides), and it follows the watched tab, so a background tab never records.
-- **The pixel lane stays warm until the mirror has something to draw.** Frames keep arriving until the first full snapshot reaches a panel, so switching lanes never trades a live picture for an empty stage. If the mirror cannot start - the page refuses the injected script, the recorder throws, the bundled artifact is missing - the panel falls back to pixels automatically **and shows the reason** instead of a blank viewer.
+- **They only run while somebody watches.** The recorder is armed when a visible panel asks for that lane and stopped when the last one stops asking (or hides), and it follows the watched tab, so a background tab never records. A capture that stops also puts the page's original title back and releases the display-capture tracks.
+- **The pixel lane stays warm until the new lane has something to draw.** Frames keep arriving until the first full snapshot (mirror) or the first chunk (capture) reaches a panel, so switching lanes never trades a live picture for an empty stage. If either cannot start - the page refuses the injected script, the recorder throws, the bundled artifact is missing, the display-capture request is denied, the recorder dies mid-stream - the panel falls back to pixels automatically **and shows the reason** instead of a blank viewer.
 
-Measured on this repository's own fixtures (5 second windows, one lane at a time, headless Chromium at 1280x800): on `grid.html`, a static page, both lanes are silent after the first paint; on `heavy.html`, 4000 absolutely-positioned nodes with 400 inline-style mutations every 50 ms, pixels cost 1169 KiB/s and the mirror 1093 KiB/s. That fixture is the mirror's worst case - it rewrites most of the document's inline styles twenty times a second - and it is worth knowing that "cheaper" is a property of the page, not of the lane: a page that mutates a little is nearly free to mirror, one that mutates everything constantly is not.
+Measured on this repository's own fixtures (5 second windows, one lane at a time, headless Chromium at 1280x800): on `grid.html`, a static page, both the pixels and the mirror are silent after the first paint; on `heavy.html`, 4000 absolutely-positioned nodes with 400 inline-style mutations every 50 ms, pixels cost 1169 KiB/s and the mirror 1093 KiB/s. That fixture is the mirror's worst case - it rewrites most of the document's inline styles twenty times a second - and it is worth knowing that "cheaper" is a property of the page, not of the lane: a page that mutates a little is nearly free to mirror, one that mutates everything constantly is not. The capture lane is measured against the pixel lane on the same page: a 800x500 animated `av.html` records at roughly 320-500 kbps of real VP8, against the pixel stream's ~1472 kbps of stills, and it is the tab's compositor output (30 fps) rather than ~10 fps of still frames.
 
-Packaging: `rrweb` is a runtime dependency, and the host injects the **UMD build this package ships** - `lib/rrweb.umd.cjs`, copied from rrweb's dist by `pnpm build`. The host never resolves a `node_modules` path at runtime, because the installed layout is not this repository's. The panel's replayer rides the normal client bundle (lazily imported, and the bundle is pinned to a single file so the module loader can serve it).
+Packaging: `rrweb` is a runtime dependency, and the host injects the **UMD build this package ships** - `lib/rrweb.umd.cjs`, copied from rrweb's dist by `pnpm build`. The host never resolves a `node_modules` path at runtime, because the installed layout is not this repository's. The panel's replayer rides the normal client bundle (lazily imported, and the bundle is pinned to a single file so the module loader can serve it). The capture lane needs no artifact at all: its two scripts are built in `src/core/capture.ts`, and the panel's player is a `MediaSource` it constructs itself.
 
 ## Interface seats
 
@@ -98,7 +99,7 @@ The single-occupant `rightbar` / `rightbar.session` seats are still not touched:
 - The token top-up only covers the site root, because DSH answers the challenge with a 303 to `./` for `GET /` alone.
 - One browser process per host; tabs are isolated CDP targets, not separate profiles.
 - Chrome must be installed at a standard location (or named by `CHROME_PATH`).
-- The DOM mirror is a non-goal for audio: the recorder is configured for DOM only, and `<video>` audio is not captured on either lane.
+- Audio is a non-goal on every lane: the mirror records DOM only, and the tab capture asks for video only (`audio: false`, no audio codec in the container), so `<video>` sound is never captured - the browser also runs with `--mute-audio`.
 
 ## Install
 

@@ -62,6 +62,14 @@ export function createFakeBrowser(options: {
     // The mirror's bootstrap answers with the verdict the host reads, not with
     // page data.
     if (expression.includes('dshBrowserViewDomMirror')) return { result: { value: 'ok' } }
+    // The capture lane's page calls, in the order the host makes them: the
+    // rename (which reports the title it replaced), the getDisplayMedia
+    // bootstrap (a verdict only), and the stop (a track report).
+    if (expression.includes('SENTINEL')) return { result: { value: 'Original title' } }
+    if (expression.includes('getDisplayMedia')) return { result: { value: 'ok' } }
+    if (expression.includes('capture.recorder')) {
+      return { result: { value: { stopped: true, tracks: 1, ended: 1 } } }
+    }
     if (expression.includes('document.querySelector')) {
       return { result: { value: { ok: true, x: 12, y: 34, tag: 'button', name: 'Go' } } }
     }

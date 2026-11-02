@@ -18,6 +18,7 @@
 import {
   BROWSER_VIEW_API_VERSION,
   BROWSER_VIEW_SOCKET_PATH,
+  CAPTURE_MIME,
 } from '../core/protocol.ts'
 import type {
   BrowserActionTrace,
@@ -74,6 +75,36 @@ export interface BrowserViewMirrorStatus {
   readonly reason?: string
 }
 
+/**
+ * Whether the host's tab capture is running for one tab.
+ *
+ * `available: false` is never silent: it is the same contract the mirror's
+ * status has, and the panel moves to the pixel lane and shows the reason instead
+ * of leaving an empty stage.
+ */
+export interface BrowserViewCaptureStatus {
+  /** Tab the status describes. */
+  readonly tabId: string
+  /** Whether the tab capture is running. */
+  readonly available: boolean
+  /** Why it is not, when the host reported a failure. */
+  readonly reason?: string
+}
+
+/** One decoded batch of tab-capture bytes, exactly as the panel needs it. */
+export interface BrowserViewCaptureChunk {
+  /** Tab the recording belongs to. */
+  readonly tabId: string
+  /** Host-side monotonic counter over chunks. */
+  readonly seq: number
+  /** Whether this chunk starts a recording rather than continues one. */
+  readonly reset: boolean
+  /** Codec of the recording, so the player builds its source buffer from it. */
+  readonly mime: string
+  /** Base64 WebM bytes, no data: prefix. */
+  readonly data: string
+}
+
 /** Callbacks the panel installs on a connection. */
 export interface BrowserViewSocketHandlers {
   /** Connection phase changed. */
@@ -86,6 +117,10 @@ export interface BrowserViewSocketHandlers {
   onDom?(batch: BrowserViewDomBatch): void
   /** The host reported whether the DOM mirror runs for a tab. */
   onMirror?(status: BrowserViewMirrorStatus): void
+  /** A chunk of the tab capture arrived, already filtered for staleness. */
+  onCaptureChunk?(chunk: BrowserViewCaptureChunk): void
+  /** The host reported whether the tab capture runs for a tab. */
+  onCapture?(status: BrowserViewCaptureStatus): void
   /** The agent performed one tool action. */
   onAction(trace: BrowserActionTrace): void
   /** The host reported a failure the panel must show instead of a frame. */
@@ -297,6 +332,36 @@ export function parseBrowserViewEvent(value: unknown): BrowserViewEvent | null {
         ...(typeof candidate.reason === 'string' ? { reason: candidate.reason } : {}),
       }
     }
+    case 'capture': {
+      if (typeof candidate.tabId !== 'string') return null
+      if (typeof candidate.available !== 'boolean') return null
+      return {
+        v: BROWSER_VIEW_API_VERSION,
+        kind: 'capture',
+        tabId: candidate.tabId,
+        available: candidate.available,
+        ...(typeof candidate.reason === 'string' ? { reason: candidate.reason } : {}),
+      }
+    }
+    case 'capture-chunk': {
+      if (typeof candidate.tabId !== 'string') return null
+      if (typeof candidate.seq !== 'number') return null
+      if (typeof candidate.data !== 'string') return null
+      return {
+        v: BROWSER_VIEW_API_VERSION,
+        kind: 'capture-chunk',
+        tabId: candidate.tabId,
+        seq: candidate.seq,
+        // An absent reset means "continue", which is the safe reading: a player
+        // that rebuilds on every chunk would never show two chunks in a row.
+        reset: candidate.reset === true,
+        // A host that omitted the codec still recorded the lane's own container;
+        // defaulting to it keeps the panel from dropping every chunk instead of
+        // playing the only thing this host has ever sent.
+        mime: typeof candidate.mime === 'string' && candidate.mime.length > 0 ? candidate.mime : CAPTURE_MIME,
+        data: candidate.data,
+      }
+    }
     case 'action': {
       const trace = candidate.trace
       if (typeof trace !== 'object' || trace === null) return null
@@ -358,6 +423,8 @@ export function connectBrowserViewSocket(
   const lastSeqByTab = new Map<string, number>()
   /** Last mirror batch drawn per tab; one recording is a stream, not a value. */
   const lastDomSeqByTab = new Map<string, number>()
+  /** Last capture chunk drawn per tab; one recording is a stream, not a value. */
+  const lastCaptureSeqByTab = new Map<string, number>()
 
   /** Publish a phase change once. */
   const setStatus = (next: BrowserViewSocketStatus): void => {
@@ -416,6 +483,29 @@ export function connectBrowserViewSocket(
           ...(event.reason === undefined ? {} : { reason: event.reason }),
         })
         return
+      case 'capture':
+        handlers.onCapture?.({
+          tabId: event.tabId,
+          available: event.available,
+          ...(event.reason === undefined ? {} : { reason: event.reason }),
+        })
+        return
+      case 'capture-chunk': {
+        // A chunk is part of a stream, so a duplicate or an overtaken one is
+        // dropped exactly like a stale frame: appending it twice would corrupt
+        // the decoder's timeline.
+        const previous = lastCaptureSeqByTab.get(event.tabId)
+        if (previous !== undefined && event.seq <= previous) return
+        lastCaptureSeqByTab.set(event.tabId, event.seq)
+        handlers.onCaptureChunk?.({
+          tabId: event.tabId,
+          seq: event.seq,
+          reset: event.reset === true,
+          mime: event.mime,
+          data: event.data,
+        })
+        return
+      }
       case 'action':
         handlers.onAction(event.trace)
         return
@@ -468,9 +558,10 @@ export function connectBrowserViewSocket(
       if (disposed) return
       attempt = 0
       lastSeqByTab.clear()
-      // The host's mirror counters restart with the host; keeping the old
-      // high-water marks would drop the whole fresh recording.
+      // The host's mirror and capture counters restart with the host; keeping
+      // the old high-water marks would drop the whole fresh recording.
       lastDomSeqByTab.clear()
+      lastCaptureSeqByTab.clear()
       setStatus('open')
       while (pending.length > 0) {
         const command = pending.shift()

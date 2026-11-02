@@ -40,6 +40,34 @@ export interface BrowserViewMirrorStatus {
     /** Why it is not, when the host reported a failure. */
     readonly reason?: string;
 }
+/**
+ * Whether the host's tab capture is running for one tab.
+ *
+ * `available: false` is never silent: it is the same contract the mirror's
+ * status has, and the panel moves to the pixel lane and shows the reason instead
+ * of leaving an empty stage.
+ */
+export interface BrowserViewCaptureStatus {
+    /** Tab the status describes. */
+    readonly tabId: string;
+    /** Whether the tab capture is running. */
+    readonly available: boolean;
+    /** Why it is not, when the host reported a failure. */
+    readonly reason?: string;
+}
+/** One decoded batch of tab-capture bytes, exactly as the panel needs it. */
+export interface BrowserViewCaptureChunk {
+    /** Tab the recording belongs to. */
+    readonly tabId: string;
+    /** Host-side monotonic counter over chunks. */
+    readonly seq: number;
+    /** Whether this chunk starts a recording rather than continues one. */
+    readonly reset: boolean;
+    /** Codec of the recording, so the player builds its source buffer from it. */
+    readonly mime: string;
+    /** Base64 WebM bytes, no data: prefix. */
+    readonly data: string;
+}
 /** Callbacks the panel installs on a connection. */
 export interface BrowserViewSocketHandlers {
     /** Connection phase changed. */
@@ -52,6 +80,10 @@ export interface BrowserViewSocketHandlers {
     onDom?(batch: BrowserViewDomBatch): void;
     /** The host reported whether the DOM mirror runs for a tab. */
     onMirror?(status: BrowserViewMirrorStatus): void;
+    /** A chunk of the tab capture arrived, already filtered for staleness. */
+    onCaptureChunk?(chunk: BrowserViewCaptureChunk): void;
+    /** The host reported whether the tab capture runs for a tab. */
+    onCapture?(status: BrowserViewCaptureStatus): void;
     /** The agent performed one tool action. */
     onAction(trace: BrowserActionTrace): void;
     /** The host reported a failure the panel must show instead of a frame. */

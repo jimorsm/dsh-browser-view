@@ -24,6 +24,7 @@ import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DEFAULT_VIEWPORT } from './protocol.ts'
+import { TAB_CAPTURE_SENTINEL_TITLE } from './capture.ts'
 
 /** Environment variable that overrides binary discovery. */
 export const CHROME_PATH_ENV = 'CHROME_PATH'
@@ -164,6 +165,17 @@ export function chromeLaunchArgs(options: {
     '--disable-default-apps',
     '--hide-scrollbars',
     '--mute-audio',
+    // The tab-capture lane (src/core/capture.ts). All three are needed before
+    // the browser starts and none of them changes anything until a page calls
+    // `getDisplayMedia`:
+    //  - the title flag skips the source picker and selects the tab whose title
+    //    equals the sentinel, which the host sets right before asking;
+    //  - the fake-UI flag makes `getDisplayMedia` resolve without the prompt a
+    //    headless browser could never show;
+    //  - the screen-capturing flag is what allows a *tab* surface at all.
+    `--auto-select-tab-capture-source-by-title=${TAB_CAPTURE_SENTINEL_TITLE}`,
+    '--use-fake-ui-for-media-stream',
+    '--enable-usermedia-screen-capturing',
     'about:blank',
   ]
   if (options.extraArgs !== undefined) args.push(...options.extraArgs)

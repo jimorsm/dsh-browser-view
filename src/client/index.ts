@@ -133,9 +133,12 @@ export function apply(ctx: ClientContext): void {
 export type { BrowserViewPanelFace, BrowserViewPanelProps, BrowserViewSocketFactory } from './panel.tsx'
 export type { BrowserViewLiveTitleStore } from './live-title.ts'
 export type { BrowserViewMirrorFactory, BrowserViewMirrorHandle } from './mirror.ts'
+export type { BrowserViewCaptureFactory, BrowserViewCaptureHandle } from './capture.ts'
 export type { BrowserViewTabParams } from './tab-type.ts'
 export type { BrowserViewTabTitleFace, BrowserViewTabTitleProps } from './tab-title.tsx'
 export type {
+  BrowserViewCaptureChunk,
+  BrowserViewCaptureStatus,
   BrowserViewDomBatch,
   BrowserViewFrame,
   BrowserViewMirrorStatus,

@@ -132,6 +132,27 @@ describe('chromeLaunchArgs', () => {
     expect(args.at(-1)).toBe('about:blank')
   })
 
+  it('operator launches and the args carry the tab-capture switches the lane needs at launch', () => {
+    // Given any launch
+    // When the launch args are built
+    // Then they carry the title-selected tab capture source, the fake media UI
+    // and the screen-capturing permission: all three must be present before the
+    // browser starts, and none of them has any effect until a page asks for a
+    // capture (see src/core/capture.ts for why each is load-bearing)
+    const args = chromeLaunchArgs({
+      port: 9224,
+      userDataDir: 'C:\\temp\\profile',
+      headless: true,
+      viewport: { width: 1280, height: 800 },
+    })
+
+    expect(args).toContain('--auto-select-tab-capture-source-by-title=BV-SENTINEL-7f3a')
+    expect(args).toContain('--use-fake-ui-for-media-stream')
+    expect(args).toContain('--enable-usermedia-screen-capturing')
+    // Audio stays off: the capture lane deliberately has no audio track.
+    expect(args).toContain('--mute-audio')
+  })
+
   it('operator asks for headful with extra switches and headless is omitted while the extras come last', () => {
     // Given a headful launch with one extra switch
     // When the launch args are built
