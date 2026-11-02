@@ -12,6 +12,7 @@ import { act } from 'react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { BrowserViewPanel } from '../../src/client/panel.tsx'
 import type { BrowserViewMirrorFactory, BrowserViewMirrorHandle } from '../../src/client/mirror.ts'
+import type { BrowserViewCaptureFactory, BrowserViewCaptureHandle } from '../../src/client/capture.ts'
 import { createLiveTitleStore } from '../../src/client/live-title.ts'
 import { en, zh } from '../../src/client/locales.ts'
 import { BROWSER_VIEW_API_VERSION } from '../../src/core/protocol.ts'
@@ -72,6 +73,44 @@ function createFakeMirrors(): FakeMirrors {
   }
 }
 
+/** One capture player the panel built, as the fake factory records it. */
+interface FakeCapture {
+  /** Element the player was attached to. */
+  readonly video: HTMLVideoElement
+  /** Chunks pushed into it after it was built. */
+  readonly appended: Uint8Array[]
+  /** Whether the panel detached it. */
+  readonly destroyed: () => boolean
+}
+
+/** Recorded capture players and the factory that produced them. */
+interface FakeCaptures {
+  readonly factory: BrowserViewCaptureFactory
+  readonly created: FakeCapture[]
+}
+
+/** A capture factory that plays nothing and records everything. */
+function createFakeCaptures(): FakeCaptures {
+  const created: FakeCapture[] = []
+  return {
+    created,
+    factory: (video): BrowserViewCaptureHandle => {
+      let dead = false
+      const player: FakeCapture = { video, appended: [], destroyed: () => dead }
+      created.push(player)
+      return {
+        append: (chunk) => { player.appended.push(chunk) },
+        destroy: () => { dead = true },
+      }
+    },
+  }
+}
+
+/** Base64 for a short literal, the way the wire carries a recorder chunk. */
+function base64(text: string): string {
+  return btoa(text)
+}
+
 /** Mounted tree shared by one case. */
 let tree: RenderedTree | null = null
 /** Fake transport fixture shared by one case. */
@@ -80,15 +119,21 @@ let sockets: FakeSocketFixture
 let channel: ReturnType<typeof createLiveTitleStore>
 /** Replayers built by the panel in one case. */
 let mirrors: FakeMirrors
+/** Capture players built by the panel in one case. */
+let captures: FakeCaptures
 
 /** Mount the body the way the sidebar does: as tab content, with no chrome of its own. */
 function mountPanel(
   dictionary: Record<string, string> = zh,
-  overrides: { readonly mirrorFactory?: BrowserViewMirrorFactory } = {},
+  overrides: {
+    readonly mirrorFactory?: BrowserViewMirrorFactory
+    readonly captureFactory?: BrowserViewCaptureFactory
+  } = {},
 ): RenderedTree {
   sockets = createFakeSockets()
   channel = createLiveTitleStore()
   mirrors = createFakeMirrors()
+  captures = createFakeCaptures()
   const mounted = render(
     <BrowserViewPanel
       t={translate(dictionary)}
@@ -96,10 +141,39 @@ function mountPanel(
       liveTitle={channel}
       socketFactory={sockets.factory}
       mirrorFactory={overrides.mirrorFactory ?? mirrors.factory}
+      captureFactory={overrides.captureFactory ?? captures.factory}
     />,
   )
   tree = mounted
   return mounted
+}
+
+/**
+ * Mount the body and put it on the capture lane, which takes two presses of the
+ * cycling switch (pixels -> dom -> capture). The switch only works once the host
+ * has reported a page, so this reports one.
+ * @param dictionary - copy to render with.
+ * @param overrides - player factory override.
+ * @returns the mounted tree, already asking the host for the capture.
+ */
+function mountPanelOnCaptureLane(
+  dictionary: Record<string, string> = zh,
+  overrides: { readonly captureFactory?: BrowserViewCaptureFactory } = {},
+): RenderedTree {
+  const mounted = mountPanel(dictionary, overrides)
+  actOn(() => {
+    sockets.latest().pushStatus('open')
+    sockets.latest().pushState(stateWithTab)
+  })
+  const mode = mounted.container.querySelector('[data-dsh-part="mode"]') as HTMLButtonElement
+  actOn(() => { mode.click() })
+  actOn(() => { mode.click() })
+  return mounted
+}
+
+/** The capture lane's stage element, when the panel drew one. */
+function captureStage(mounted: RenderedTree): HTMLVideoElement | null {
+  return mounted.container.querySelector('[data-dsh-part="capture"]') as HTMLVideoElement | null
 }
 
 /**
@@ -601,5 +675,193 @@ describe('browser view lane switch and DOM mirror', () => {
     // When the toolbar is drawn
     // Then the switch is named in English rather than in the source language
     expect(mounted.container.querySelector('[data-dsh-part="mode"]')?.textContent).toBe(en['panel.mode.pixels'])
+  })
+})
+
+describe('browser view lane switch and tab capture', () => {
+  it('user presses the switch twice and the host is asked for the tab capture', () => {
+    // Given a mounted body on the pixel lane, which is where a panel starts
+    const mounted = mountPanel()
+    actOn(() => {
+      sockets.latest().pushStatus('open')
+      sockets.latest().pushState(stateWithTab)
+    })
+    const mode = mounted.container.querySelector('[data-dsh-part="mode"]') as HTMLButtonElement
+
+    // When the switch is pressed twice, cycling through the mirror
+    actOn(() => { mode.click() })
+    actOn(() => { mode.click() })
+
+    // Then the host receives both lanes in order and the switch names the capture
+    expect(sockets.latest().sent.filter(command => command.kind === 'mode')).toEqual([
+      { v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'pixels' },
+      { v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'dom' },
+      { v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'capture' },
+    ])
+    expect(mounted.container.querySelector('[data-dsh-part="mode"]')?.getAttribute('data-mode')).toBe('capture')
+    expect(mounted.container.querySelector('[data-dsh-part="mode"]')?.textContent).toBe(zh['panel.mode.capture'])
+  })
+
+  it('user presses the switch once more and it wraps back to the pixel lane', () => {
+    // Given a body on the capture lane
+    const mounted = mountPanelOnCaptureLane()
+
+    // When the switch is pressed again
+    const mode = mounted.container.querySelector('[data-dsh-part="mode"]') as HTMLButtonElement
+    actOn(() => { mode.click() })
+
+    // Then the lane is the one that draws any page, and the host is told
+    expect(mounted.container.querySelector('[data-dsh-part="mode"]')?.getAttribute('data-mode')).toBe('pixels')
+    expect(sockets.latest().sent.filter(command => command.kind === 'mode').at(-1))
+      .toEqual({ v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'pixels' })
+  })
+
+  it('a recording header arrives and the capture player replaces the pixel stage', async () => {
+    // Given a body on the capture lane still showing the pixel picture
+    const mounted = mountPanelOnCaptureLane()
+    actOn(() => {
+      sockets.latest().pushState(stateWithTab)
+      sockets.latest().pushFrame({ tabId: 'tab-1', seq: 1, width: 1280, height: 800, data: 'AAAA' })
+    })
+    expect(mounted.container.querySelector('[data-dsh-part="frame"]')).not.toBeNull()
+
+    // When a reset chunk arrives
+    await actAsync(() => {
+      sockets.latest().pushCaptureChunk({
+        tabId: 'tab-1', seq: 1, reset: true, mime: 'video/webm;codecs=vp8', data: base64('HEADER'),
+      })
+    })
+
+    // Then the player was built over the capture stage, the header was appended
+    // to it, and the picture it replaces is gone
+    expect(captures.created).toHaveLength(1)
+    expect(captures.created[0].video).toBe(captureStage(mounted))
+    expect(Array.from(captures.created[0].appended[0] ?? [])).toEqual(Array.from(new TextEncoder().encode('HEADER')))
+    expect(mounted.container.querySelector('[data-dsh-part="frame"]')).toBeNull()
+  })
+
+  it('a live chunk arrives and it is appended without a rebuild', async () => {
+    // Given a body whose player was built from a header chunk
+    const mounted = mountPanelOnCaptureLane()
+    actOn(() => { sockets.latest().pushState(stateWithTab) })
+    await actAsync(() => {
+      sockets.latest().pushCaptureChunk({
+        tabId: 'tab-1', seq: 1, reset: true, mime: 'video/webm;codecs=vp8', data: base64('HEADER'),
+      })
+    })
+
+    // When one more chunk arrives
+    await actAsync(() => {
+      sockets.latest().pushCaptureChunk({
+        tabId: 'tab-1', seq: 2, reset: false, mime: 'video/webm;codecs=vp8', data: base64('CLUSTER'),
+      })
+    })
+
+    // Then the same player received both and no second one was built
+    expect(captures.created).toHaveLength(1)
+    expect(captures.created[0].appended).toHaveLength(2)
+    expect(Array.from(captures.created[0].appended[1] ?? [])).toEqual(Array.from(new TextEncoder().encode('CLUSTER')))
+  })
+
+  it('a chunk for a tab the panel already left is ignored', async () => {
+    // Given a body on the capture lane watching one page
+    const mounted = mountPanelOnCaptureLane()
+    actOn(() => { sockets.latest().pushState(stateWithTab) })
+
+    // When a recording arrives for a different tab
+    await actAsync(() => {
+      sockets.latest().pushCaptureChunk({
+        tabId: 'tab-other', seq: 1, reset: true, mime: 'video/webm;codecs=vp8', data: base64('HEADER'),
+      })
+    })
+
+    // Then nothing was built for it and the stage is still there for its own tab
+    expect(captures.created).toHaveLength(0)
+    expect(captureStage(mounted)).not.toBeNull()
+  })
+
+  it('the host reports the capture unavailable and the panel moves to pixels with the reason', () => {
+    // Given a body on the capture lane with a page open
+    const mounted = mountPanelOnCaptureLane()
+
+    // When the host reports the capture of that tab as unavailable
+    actOn(() => {
+      sockets.latest().pushCapture({ tabId: 'tab-1', available: false, reason: 'permission denied' })
+    })
+
+    // Then the pixel lane is shown, the reason is on screen, and the host is not
+    // asked again - it already moved this sink
+    expect(mounted.container.querySelector('[data-dsh-part="mode"]')?.getAttribute('data-mode')).toBe('pixels')
+    expect(mounted.container.querySelector('[data-dsh-part="capture-notice"]')?.textContent)
+      .toContain('permission denied')
+    expect(sockets.latest().sent.filter(command => command.kind === 'mode').at(-1))
+      .toEqual({ v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'capture' })
+  })
+
+  it('the capture player cannot be built and the panel falls back to pixels with the failure', async () => {
+    // Given a body whose player throws when it is built
+    const mounted = mountPanelOnCaptureLane(zh, {
+      captureFactory: () => { throw new Error('this browser cannot play video/webm;codecs=vp8 through MSE') },
+    })
+    actOn(() => { sockets.latest().pushState(stateWithTab) })
+
+    // When a recording header arrives
+    await actAsync(() => {
+      sockets.latest().pushCaptureChunk({
+        tabId: 'tab-1', seq: 1, reset: true, mime: 'video/webm;codecs=vp8', data: base64('HEADER'),
+      })
+    })
+
+    // Then the panel tells the host to send pixels again and shows why
+    expect(mounted.container.querySelector('[data-dsh-part="mode"]')?.getAttribute('data-mode')).toBe('pixels')
+    expect(mounted.container.querySelector('[data-dsh-part="capture-notice"]')?.textContent)
+      .toContain('cannot play video/webm;codecs=vp8')
+    expect(sockets.latest().sent.filter(command => command.kind === 'mode').at(-1))
+      .toEqual({ v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'pixels' })
+  })
+
+  it('user switches lanes after a capture fallback and the notice goes away', () => {
+    // Given a body whose capture the host has just reported unavailable
+    const mounted = mountPanelOnCaptureLane()
+    actOn(() => {
+      sockets.latest().pushState(stateWithTab)
+      sockets.latest().pushCapture({ tabId: 'tab-1', available: false, reason: 'permission denied' })
+    })
+    expect(mounted.container.querySelector('[data-dsh-part="capture-notice"]')).not.toBeNull()
+
+    // When the person presses the switch again
+    const mode = mounted.container.querySelector('[data-dsh-part="mode"]') as HTMLButtonElement
+    actOn(() => { mode.click() })
+
+    // Then the notice is gone, because it described a lane that is no longer chosen
+    expect(mounted.container.querySelector('[data-dsh-part="capture-notice"]')).toBeNull()
+  })
+
+  it('user closes the panel and the running capture player is torn down', async () => {
+    // Given a mounted body with a running player
+    const mounted = mountPanelOnCaptureLane()
+    actOn(() => { sockets.latest().pushState(stateWithTab) })
+    await actAsync(() => {
+      sockets.latest().pushCaptureChunk({
+        tabId: 'tab-1', seq: 1, reset: true, mime: 'video/webm;codecs=vp8', data: base64('HEADER'),
+      })
+    })
+    expect(captures.created).toHaveLength(1)
+
+    // When the tab is closed
+    mounted.unmount()
+    tree = null
+
+    // Then the player released its element
+    expect(captures.created[0].destroyed()).toBe(true)
+  })
+
+  it('user loads the tab body with the English dictionary and the capture label follows', () => {
+    // Given a body mounted with the English dictionary
+    const mounted = mountPanelOnCaptureLane(en)
+
+    // When the switch is drawn on the capture lane
+    // Then it is named in English rather than in the source language
+    expect(mounted.container.querySelector('[data-dsh-part="mode"]')?.textContent).toBe(en['panel.mode.capture'])
   })
 })

@@ -29,20 +29,24 @@
  * a context lifecycle and an invalidation race for zero gain, while the image
  * element decodes off the main thread and lets CSS own the aspect-ratio fit.
  *
- * Two lanes. The default is the DOM mirror: the host serializes the page with
- * rrweb and streams its mutations, and this body replays them as real DOM, so
- * text stays crisp and the traffic is event-sized instead of frame-sized. The
- * pixel lane is kept, one click away, because a DOM cannot show a `<video>`, a
- * canvas or native UI - and because it is the fallback when the mirror cannot
- * start, in which case the reason is shown rather than an empty stage. While a
- * mirror is still being armed the pixel lane stays on screen, so the switch
- * never trades a live picture for a blank one.
+ * Three lanes. The default is the pixel stream: it draws any page, including a
+ * `<video>` or a canvas, and its cost is predictable, so it is what the lane
+ * nobody asked for should be. The DOM mirror (`dom`) replays the page as real
+ * DOM, so text stays crisp and the traffic is event-sized instead of
+ * frame-sized. The tab capture (`capture`) is the picture a DOM cannot have: the
+ * host records the watched tab's own surface and the panel plays the chunks with
+ * MSE, which is the only lane that shows a cross-origin CDN video without paying
+ * the still-frame cost of the pixel lane. Either non-default lane falls back to
+ * pixels with the reason shown when it cannot start, and while a lane is still
+ * arming the pixel stage stays on screen, so the switch never trades a live
+ * picture for a blank one.
  *
- * The mirror is read-only. Mapping a click on a replayed node back to a CDP
- * action on the recorded page's element is deliberately not implemented here:
- * rrweb's replayer renders into its own iframe whose nodes are a reconstruction,
- * not the page, so a click would have to be resolved against a node id the host
- * never sees. Input stays on the pixel stage until that mapping exists.
+ * The switch is one cycling control rather than three buttons: the toolbar has
+ * room for one 28px tool beside the refresh control, and the button names the
+ * lane currently on screen. Input mapping for the mirror and the capture is
+ * deliberately absent - both are read-only reconstructions, and a click there
+ * has no element in the watched page to land on - so input stays on the pixel
+ * stage until that mapping exists.
  *
  * Input relay: the live frame is also an interactive surface. Pointer and key
  * events on the image are rescaled to the host-pinned viewport and relayed as
@@ -69,6 +73,12 @@ import { BROWSER_VIEW_API_VERSION } from '../core/protocol.ts'
 import { FrameAssembler, readFrameChunk } from './frame-assembly.ts'
 import type { BrowserViewLiveTitleStore } from './live-title.ts'
 import { createRrwebMirror, type BrowserViewMirrorFactory, type BrowserViewMirrorHandle } from './mirror.ts'
+import {
+  createMseCapture,
+  decodeCaptureChunk,
+  type BrowserViewCaptureFactory,
+  type BrowserViewCaptureHandle,
+} from './capture.ts'
 import { BROWSER_VIEW_PARTS, BROWSER_VIEW_PLUGIN } from './semantic.ts'
 import {
   connectBrowserViewSocket,
@@ -101,6 +111,27 @@ export type BrowserViewPanelProps = PropsLocale<'browser-view'> & Partial<Browse
    * browser to replay into; the default loads rrweb lazily.
    */
   readonly mirrorFactory?: BrowserViewMirrorFactory
+  /**
+   * Builds the tab capture's player. Overridden by tests, which have no
+   * `MediaSource` in jsdom; the default is the MSE player.
+   */
+  readonly captureFactory?: BrowserViewCaptureFactory
+}
+
+/** The lanes the switch cycles through, in the order pressing it moves. */
+const LANE_ORDER: ReadonlyArray<BrowserViewLane> = ['pixels', 'dom', 'capture']
+
+/** Label key for each lane, so the switch names what is on screen. */
+const LANE_LABELS: Record<BrowserViewLane, 'panel.mode.pixels' | 'panel.mode.dom' | 'panel.mode.capture'> = {
+  pixels: 'panel.mode.pixels',
+  dom: 'panel.mode.dom',
+  capture: 'panel.mode.capture',
+}
+
+/** The lane one press of the switch moves to. */
+function nextLane(current: BrowserViewLane): BrowserViewLane {
+  const index = LANE_ORDER.indexOf(current)
+  return LANE_ORDER[(index + 1) % LANE_ORDER.length] ?? 'pixels'
 }
 
 /** Trace rows kept on screen; older tool calls scroll out of relevance. */
@@ -119,18 +150,17 @@ function cx(...names: ReadonlyArray<string | false | null | undefined>): string 
  * @param props - composed slot props.
  * @returns the tab content.
  */
-export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, location, mirrorFactory }: BrowserViewPanelProps) {
+export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, location, mirrorFactory, captureFactory }: BrowserViewPanelProps) {
   const [state, setState] = useState<BrowserPanelState>(EMPTY_STATE)
   const [frame, setFrame] = useState<BrowserViewFrame | null>(null)
   const [traces, setTraces] = useState<ReadonlyArray<BrowserActionTrace>>([])
   const [error, setError] = useState<{ readonly code: string; readonly message: string } | null>(null)
   const [status, setStatus] = useState<BrowserViewSocketStatus>('connecting')
   /**
-   * Lane this panel renders. The pixel lane is the default: it draws any page,
-   * including the video and canvas pages a mirror has no picture for, and its
-   * cost is predictable. The DOM mirror is one click away for crisp text and for
-   * pages that mutate little - measured savings are a property of the page, not
-   * of the lane, so the lane nobody asked for should not be the one they get.
+   * Lane this panel renders. The pixel stream is the default: it draws any page,
+   * including the video and canvas pages neither other lane has a picture for,
+   * and its cost is predictable. The DOM mirror and the tab capture are each one
+   * press away, for crisp text and for a real video picture respectively.
    */
   const [lane, setLane] = useState<BrowserViewLane>('pixels')
   /** Bumped for every checkpoint batch, which is what rebuilds the replayer. */
@@ -139,6 +169,12 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
   const [mirrorReady, setMirrorReady] = useState(false)
   /** Why the mirror is not running; shown beside the pixel picture it fell in to. */
   const [mirrorNotice, setMirrorNotice] = useState<string | null>(null)
+  /** Bumped for every `reset` chunk, which is what rebuilds the capture player. */
+  const [captureCheckpoints, setCaptureCheckpoints] = useState(0)
+  /** Whether the capture player is mounted and playing. */
+  const [captureReady, setCaptureReady] = useState(false)
+  /** Why the capture is not running; shown beside the pixel picture it fell in to. */
+  const [captureNotice, setCaptureNotice] = useState<string | null>(null)
   const socketRef = useRef<BrowserViewSocket | null>(null)
   /** Last active tab seen in a state push; a tab switch invalidates the picture. */
   const lastActiveTabRef = useRef<string | null>(null)
@@ -150,24 +186,34 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
   const mirrorHandleRef = useRef<BrowserViewMirrorHandle | null>(null)
   /** Element the replayer is mounted into. */
   const mirrorRootRef = useRef<HTMLDivElement | null>(null)
+  /** The chunk the capture player is (re)built from; a WebM header. */
+  const captureCheckpointRef = useRef<Uint8Array<ArrayBuffer> | null>(null)
+  /** Mounted capture player; live chunks are pushed into it as they arrive. */
+  const captureHandleRef = useRef<BrowserViewCaptureHandle | null>(null)
+  /** Element the capture player is attached to. */
+  const captureRef = useRef<HTMLVideoElement | null>(null)
 
   /**
-   * Move to the pixel lane because the mirror cannot be shown, and say why.
+   * Move to the pixel lane because a lane cannot be shown, and say why.
    *
    * The host is told, not just the state: it is the side that stops sending
-   * frames once a mirror is live, so a panel that quietly stops rendering the
-   * mirror would freeze on its last drawn state. Not sending it in the
-   * host-driven case is deliberate - there the host has already moved this
-   * sink and sending it back would be a round trip that changes nothing.
+   * frames once another lane is live, so a panel that quietly stopped rendering
+   * that lane would freeze on its last drawn state. Not sending it in the
+   * host-driven case is deliberate - there the host has already moved this sink
+   * and sending it back would be a round trip that changes nothing.
    * @param reason - what to show the person watching.
+   * @param tellHost - whether the host moved this sink itself (false) or not.
+   * @param source - which lane failed, so the notice names the right one.
    */
-  const fallBackToPixels = (reason: string, tellHost = true): void => {
+  const fallBackToPixels = (reason: string, tellHost = true, source: 'mirror' | 'capture' = 'mirror'): void => {
     if (laneRef.current !== 'pixels') {
       laneRef.current = 'pixels'
       setLane('pixels')
     }
     setMirrorReady(false)
-    setMirrorNotice(reason)
+    setCaptureReady(false)
+    if (source === 'capture') setCaptureNotice(reason)
+    else setMirrorNotice(reason)
     if (tellHost) socketRef.current?.send({ v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'pixels' })
   }
 
@@ -204,6 +250,11 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
           mirrorCheckpointRef.current = []
           setMirrorCheckpoints(0)
           setMirrorReady(false)
+          // Same for the capture: a player holding the old tab's media source
+          // can never decode the new tab's headers.
+          captureCheckpointRef.current = null
+          setCaptureCheckpoints(0)
+          setCaptureReady(false)
         }
         setState(next)
       },
@@ -232,6 +283,29 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
         // The host has already moved this sink to pixels, so this is the
         // no-round-trip branch of the fallback.
         fallBackToPixels(mirror.reason ?? t('panel.mirror.unavailable'), false)
+      },
+      onCapture: (capture) => {
+        if (capture.available) return
+        if (lastActiveTabRef.current !== null && capture.tabId !== lastActiveTabRef.current) return
+        // Same contract as the mirror's status: the host moved this sink, the
+        // reason travels with the move, and the person sees the pixel lane.
+        fallBackToPixels(capture.reason ?? t('panel.capture.unavailable'), false, 'capture')
+      },
+      onCaptureChunk: (chunk) => {
+        // A chunk for a tab the panel has already left would feed the wrong
+        // media source.
+        if (lastActiveTabRef.current !== null && chunk.tabId !== lastActiveTabRef.current) return
+        const bytes = decodeCaptureChunk(chunk.data)
+        if (bytes === null) return
+        if (chunk.reset) {
+          // A reset chunk is a container header: the player holding the previous
+          // recording cannot continue from it and is rebuilt instead.
+          captureCheckpointRef.current = bytes
+          setCaptureReady(false)
+          setCaptureCheckpoints((current) => current + 1)
+          return
+        }
+        captureHandleRef.current?.append(bytes)
       },
       onAction: (trace) => {
         setTraces((current) => [trace, ...current].slice(0, TRACE_LIMIT))
@@ -288,6 +362,51 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
     }
   }, [lane, mirrorCheckpoints, mirrorFactory])
 
+  // Mount, rebuild and tear down the tab-capture player.
+  //
+  // Same shape as the mirror's effect and for the same reason: the player is
+  // built once from a `reset` chunk - the recorder's container header - and then
+  // fed live chunks, so a checkpoint replaces the media source exactly once
+  // instead of every chunk. The pixel stage stays on screen until the player is
+  // up, which is what keeps the lane from showing an empty box while the capture
+  // arms.
+  useEffect(() => {
+    if (lane !== 'capture' || captureCheckpoints === 0) return
+    const element = captureRef.current
+    if (element === null) return
+    const build = captureFactory ?? createMseCapture
+    let cancelled = false
+    let handle: BrowserViewCaptureHandle | null = null
+    // Started on a resolved promise, not called directly: a factory that throws
+    // synchronously must land in the same catch as one that rejects, or the
+    // failure would escape the effect and take the whole tab down with it.
+    void Promise.resolve()
+      .then(() => build(element))
+      .then((created) => {
+        if (cancelled) {
+          created.destroy()
+          return
+        }
+        handle = created
+        captureHandleRef.current = created
+        const checkpoint = captureCheckpointRef.current
+        if (checkpoint !== null) created.append(checkpoint)
+        setCaptureReady(true)
+      })
+      .catch((failure: unknown) => {
+        if (cancelled) return
+        // A player that cannot be built is a capture that cannot be shown:
+        // fall back with the reason rather than leave a blank stage.
+        fallBackToPixels(failure instanceof Error ? failure.message : String(failure), true, 'capture')
+      })
+    return () => {
+      cancelled = true
+      handle?.destroy()
+      captureHandleRef.current = null
+      setCaptureReady(false)
+    }
+  }, [lane, captureCheckpoints, captureFactory])
+
   const activeTab = state.tabs.find((tab) => tab.id === state.activeTabId) ?? null
   // Loading is per tab on the wire; the connection phase joins it so a page
   // that is still dialing never claims to be live.
@@ -334,14 +453,20 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
   /** Reassembles chunked DataChannel frames. */
   const assemblerRef = useRef(new FrameAssembler())
 
-  /** One lane switch: the panel tells the host and moves its own stage. */
+  /**
+   * One lane switch: the panel tells the host and moves its own stage.
+   *
+   * Both notices are cleared, not just the one for the lane being entered: a
+   * person pressing the switch is asking for a fresh attempt, and an old failure
+   * reason left on screen would describe a lane that is no longer selected.
+   */
   const switchLane = (next: BrowserViewLane): void => {
     laneRef.current = next
     setLane(next)
-    // A person asking for a lane is also clearing the last failure's notice;
-    // the host clears its own record of it on the same command.
     setMirrorNotice(null)
+    setCaptureNotice(null)
     setMirrorReady(false)
+    setCaptureReady(false)
     socketRef.current?.send({ v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: next })
   }
 
@@ -617,9 +742,9 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
           title={t('panel.mode.switch')}
           aria-label={t('panel.mode.switch')}
           disabled={activeTab === null}
-          onClick={() => { switchLane(lane === 'dom' ? 'pixels' : 'dom') }}
+          onClick={() => { switchLane(nextLane(lane)) }}
         >
-          {lane === 'dom' ? t('panel.mode.dom') : t('panel.mode.pixels')}
+          {t(LANE_LABELS[lane])}
         </button>
         <button
           type="button"
@@ -672,42 +797,60 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
                 data-dsh-part={BROWSER_VIEW_PARTS.mirror}
               />
             )}
+            {/* Same rule for the capture: the media source is attached to this
+                element, so it exists from the moment the lane is chosen and is
+                only hidden until the first chunk has been appended. */}
+            {lane === 'capture' && (
+              <video
+                ref={captureRef}
+                className={cx(css.capture, !captureReady && css.captureIdle)}
+                data-dsh-part={BROWSER_VIEW_PARTS.capture}
+                muted
+                playsInline
+                autoPlay
+              />
+            )}
             {lane === 'dom' && mirrorReady ? null
-              : dataUrl === null || visibleFrame === null
-                ? lane === 'dom' && activeTab !== null
-                  // A page is open and the mirror is arming: say so instead of
-                  // showing the no-page placeholder or an empty stage.
-                  ? <div className={css.mirrorNote} data-dsh-part={BROWSER_VIEW_PARTS.mirrorStarting}>{t('panel.mirror.starting')}</div>
-                  : (
-                    <div className={css.empty} data-dsh-part={BROWSER_VIEW_PARTS.empty}>
-                      <span className={css.emptyTitle}>{t('panel.empty.title')}</span>
-                      <span className={css.emptyHint}>{t('panel.empty.hint')}</span>
-                    </div>
-                  )
-                : dcActive ? (
-                  <canvas
-                    ref={canvasRef}
-                    className={css.frame}
-                    data-dsh-part={BROWSER_VIEW_PARTS.frame}
-                    width={visibleFrame.width}
-                    height={visibleFrame.height}
-                    style={{ cursor: 'default', outline: 'none' }}
-                    {...inputHandlers}
-                  />
-                ) : (
-                  <img
-                    ref={frameRef}
-                    className={css.frame}
-                    data-dsh-part={BROWSER_VIEW_PARTS.frame}
-                    src={dataUrl}
-                    alt={t('panel.frame.alt')}
-                    width={visibleFrame.width}
-                    height={visibleFrame.height}
-                    draggable={false}
-                    style={{ cursor: 'default', outline: 'none' }}
-                    {...inputHandlers}
-                  />
-                )}
+              : lane === 'capture' && captureReady ? null
+                : dataUrl === null || visibleFrame === null
+                  ? lane !== 'pixels' && activeTab !== null
+                    // A page is open and the chosen lane is arming: say so
+                    // instead of showing the no-page placeholder or an empty box.
+                    ? (
+                      <div className={css.mirrorNote} data-dsh-part={lane === 'capture' ? BROWSER_VIEW_PARTS.captureStarting : BROWSER_VIEW_PARTS.mirrorStarting}>
+                        {lane === 'capture' ? t('panel.capture.starting') : t('panel.mirror.starting')}
+                      </div>
+                    )
+                    : (
+                      <div className={css.empty} data-dsh-part={BROWSER_VIEW_PARTS.empty}>
+                        <span className={css.emptyTitle}>{t('panel.empty.title')}</span>
+                        <span className={css.emptyHint}>{t('panel.empty.hint')}</span>
+                      </div>
+                    )
+                  : dcActive ? (
+                    <canvas
+                      ref={canvasRef}
+                      className={css.frame}
+                      data-dsh-part={BROWSER_VIEW_PARTS.frame}
+                      width={visibleFrame.width}
+                      height={visibleFrame.height}
+                      style={{ cursor: 'default', outline: 'none' }}
+                      {...inputHandlers}
+                    />
+                  ) : (
+                    <img
+                      ref={frameRef}
+                      className={css.frame}
+                      data-dsh-part={BROWSER_VIEW_PARTS.frame}
+                      src={dataUrl}
+                      alt={t('panel.frame.alt')}
+                      width={visibleFrame.width}
+                      height={visibleFrame.height}
+                      draggable={false}
+                      style={{ cursor: 'default', outline: 'none' }}
+                      {...inputHandlers}
+                    />
+                  )}
           </>
         )}
       </div>
@@ -715,6 +858,12 @@ export function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, locat
         <div className={css.mirrorNotice} data-dsh-part={BROWSER_VIEW_PARTS.mirrorNotice} role="status">
           {t('panel.mirror.unavailable')}
           {mirrorNotice}
+        </div>
+      )}
+      {captureNotice !== null && (
+        <div className={css.captureNotice} data-dsh-part={BROWSER_VIEW_PARTS.captureNotice} role="status">
+          {t('panel.capture.unavailable')}
+          {captureNotice}
         </div>
       )}
       <footer className={css.trace} data-dsh-part={BROWSER_VIEW_PARTS.trace}>

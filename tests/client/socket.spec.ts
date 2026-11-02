@@ -7,6 +7,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { BROWSER_VIEW_SOCKET_PATH } from '../../src/core/protocol.ts'
 import type {
+  BrowserViewCaptureChunk,
+  BrowserViewCaptureStatus,
   BrowserViewDomBatch,
   BrowserViewMirrorStatus,
   BrowserViewSocketHandlers,
@@ -80,6 +82,8 @@ interface Recorded {
   readonly errors: Array<{ code: string; message: string }>
   readonly doms: BrowserViewDomBatch[]
   readonly mirrors: BrowserViewMirrorStatus[]
+  readonly captures: BrowserViewCaptureStatus[]
+  readonly captureChunks: BrowserViewCaptureChunk[]
   readonly states: unknown[]
   readonly statuses: string[]
 }
@@ -91,6 +95,8 @@ function record(): Recorded {
   const errors: Array<{ code: string; message: string }> = []
   const doms: BrowserViewDomBatch[] = []
   const mirrors: BrowserViewMirrorStatus[] = []
+  const captures: BrowserViewCaptureStatus[] = []
+  const captureChunks: BrowserViewCaptureChunk[] = []
   const states: unknown[] = []
   const statuses: string[] = []
   const handlers: BrowserViewSocketHandlers = {
@@ -100,9 +106,11 @@ function record(): Recorded {
     onAction: (trace) => { actions.push({ tool: trace.tool, summary: trace.summary }) },
     onDom: (batch) => { doms.push(batch) },
     onMirror: (mirror) => { mirrors.push(mirror) },
+    onCapture: (capture) => { captures.push(capture) },
+    onCaptureChunk: (chunk) => { captureChunks.push(chunk) },
     onError: (code, message) => { errors.push({ code, message }) },
   }
-  return { handlers, frames, actions, errors, doms, mirrors, states, statuses }
+  return { handlers, frames, actions, errors, doms, mirrors, captures, captureChunks, states, statuses }
 }
 
 /** Timer seam that runs callbacks only when the test advances them. */
@@ -530,5 +538,105 @@ describe('browser view mirror events', () => {
     expect(seen.doms).toHaveLength(0)
     expect(seen.frames).toHaveLength(0)
     expect(transport.closed).toBe(false)
+  })
+})
+
+describe('the tab capture wire', () => {
+  it('host sends capture chunks and the panel narrows them to their wire shape', () => {
+    // Given an open socket
+    resetTransports()
+    const seen = record()
+    connectBrowserViewSocket(seen.handlers, { WebSocketImpl: FakeTransport, location: origin })
+    const transport = FakeTransport.instances[0]
+    transport.fireOpen()
+
+    // When a recording starts with a header chunk and continues with another
+    transport.fireMessage({
+      v: 1, kind: 'capture-chunk', tabId: 'tab-1', seq: 1, reset: true,
+      mime: 'video/webm;codecs=vp8', data: 'HEADER',
+    })
+    transport.fireMessage({
+      v: 1, kind: 'capture-chunk', tabId: 'tab-1', seq: 2,
+      mime: 'video/webm;codecs=vp8', data: 'CLUSTER',
+    })
+
+    // Then both arrive, the first marked as the start of a recording
+    expect(seen.captureChunks).toEqual([
+      { tabId: 'tab-1', seq: 1, reset: true, mime: 'video/webm;codecs=vp8', data: 'HEADER' },
+      { tabId: 'tab-1', seq: 2, reset: false, mime: 'video/webm;codecs=vp8', data: 'CLUSTER' },
+    ])
+  })
+
+  it('host sends a chunk the panel already drew and it is dropped, per tab', () => {
+    // Given a socket that drew sequence 5 and 6 for one tab
+    resetTransports()
+    const seen = record()
+    connectBrowserViewSocket(seen.handlers, { WebSocketImpl: FakeTransport, location: origin })
+    const transport = FakeTransport.instances[0]
+    transport.fireOpen()
+    const chunk = (tabId: string, seq: number): unknown =>
+      ({ v: 1, kind: 'capture-chunk', tabId, seq, mime: 'video/webm;codecs=vp8', data: `C${seq}` })
+
+    transport.fireMessage(chunk('tab-1', 5))
+    transport.fireMessage(chunk('tab-1', 5))
+    transport.fireMessage(chunk('tab-1', 4))
+    transport.fireMessage(chunk('tab-2', 4))
+
+    // Then only the first of the pair survived, and the other tab has its own counter
+    expect(seen.captureChunks.map(entry => `${entry.tabId}:${entry.seq}`)).toEqual(['tab-1:5', 'tab-2:4'])
+  })
+
+  it('host reports the capture unavailable and the panel is told which tab and why', () => {
+    // Given an open socket
+    resetTransports()
+    const seen = record()
+    connectBrowserViewSocket(seen.handlers, { WebSocketImpl: FakeTransport, location: origin })
+    const transport = FakeTransport.instances[0]
+    transport.fireOpen()
+
+    // When the host reports the capture of one tab as unavailable
+    transport.fireMessage({ v: 1, kind: 'capture', tabId: 'tab-1', available: false, reason: 'permission denied' })
+
+    // Then the panel receives the tab and the reason, which is what it shows
+    // beside the pixel picture instead of an empty stage
+    expect(seen.captures).toEqual([{ tabId: 'tab-1', available: false, reason: 'permission denied' }])
+  })
+
+  it('host sends a chunk with no codec and the client falls back to the lane codec', () => {
+    // Given a payload from a host that omitted the mime field
+    // When it is parsed
+    // Then the lane's own container is assumed rather than the chunk dropped
+    const parsed = parseBrowserViewEvent({
+      v: 1, kind: 'capture-chunk', tabId: 'tab-1', seq: 1, data: 'HEADER',
+    })
+
+    expect(parsed).toMatchObject({ kind: 'capture-chunk', mime: 'video/webm;codecs=vp8', reset: false })
+  })
+
+  it('host reconnects and the capture counters restart with it', () => {
+    // Given a socket that drew a high sequence number and then reconnected
+    resetTransports()
+    const seen = record()
+    const timers = manualTimers()
+    connectBrowserViewSocket(seen.handlers, {
+      WebSocketImpl: FakeTransport,
+      location: origin,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+    })
+    const first = FakeTransport.instances[0]
+    first.fireOpen()
+    first.fireMessage({ v: 1, kind: 'capture-chunk', tabId: 'tab-1', seq: 42, mime: 'video/webm;codecs=vp8', data: 'OLD' })
+    first.fireClose()
+    timers.runNext()
+    const second = FakeTransport.instances[1]
+    second.fireOpen()
+
+    // When the new host sends its own first chunk
+    second.fireMessage({ v: 1, kind: 'capture-chunk', tabId: 'tab-1', seq: 1, reset: true, mime: 'video/webm;codecs=vp8', data: 'NEW' })
+
+    // Then it is not mistaken for a stale chunk from the old host
+    expect(seen.captureChunks).toHaveLength(2)
+    expect(seen.captureChunks[1]).toMatchObject({ seq: 1, reset: true, data: 'NEW' })
   })
 })

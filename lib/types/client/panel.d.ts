@@ -1,6 +1,7 @@
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots';
 import type { BrowserViewLiveTitleStore } from './live-title.ts';
 import { type BrowserViewMirrorFactory } from './mirror.ts';
+import { type BrowserViewCaptureFactory } from './capture.ts';
 import { type BrowserViewSocket, type BrowserViewSocketHandlers } from './socket.ts';
 /** Page-side socket factory; tests inject a fake transport through it. */
 export type BrowserViewSocketFactory = (handlers: BrowserViewSocketHandlers) => BrowserViewSocket;
@@ -25,10 +26,15 @@ export type BrowserViewPanelProps = PropsLocale<'browser-view'> & Partial<Browse
      * browser to replay into; the default loads rrweb lazily.
      */
     readonly mirrorFactory?: BrowserViewMirrorFactory;
+    /**
+     * Builds the tab capture's player. Overridden by tests, which have no
+     * `MediaSource` in jsdom; the default is the MSE player.
+     */
+    readonly captureFactory?: BrowserViewCaptureFactory;
 };
 /**
  * Render the browser view tab body.
  * @param props - composed slot props.
  * @returns the tab content.
  */
-export declare function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, location, mirrorFactory }: BrowserViewPanelProps): import("react").JSX.Element;
+export declare function BrowserViewPanel({ t, sessionId, liveTitle, socketFactory, location, mirrorFactory, captureFactory }: BrowserViewPanelProps): import("react").JSX.Element;

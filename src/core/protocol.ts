@@ -28,6 +28,11 @@
  * `invalid-command` error, and a panel that receives a kind it does not know
  * drops that message instead of throwing. An added event kind must therefore
  * never be one a panel has to understand to keep working.
+ *
+ * Kept at 1 once more for the `capture` lane, its `capture` status and its
+ * `capture-chunk` payload, which obey exactly that rule: an older panel never
+ * sends `mode: 'capture'`, an older host answers it with one `invalid-command`
+ * error, and a payload kind this version does not know is dropped unread.
  */
 export const BROWSER_VIEW_API_VERSION = 1
 
@@ -97,10 +102,31 @@ export interface BrowserPanelState {
  *
  * `dom` is the DOM mirror: the page is serialized by the host and replayed as
  * live DOM, which keeps text crisp and costs event-sized traffic instead of
- * frame-sized. `pixels` is the original screencast, which is the only lane that
- * can show a `<video>`, a canvas or native UI.
+ * frame-sized. `pixels` is the original screencast, the fallback that draws
+ * anything at all. `capture` is the tab capture: the host records the watched
+ * tab's own compositor output with `getDisplayMedia` + `MediaRecorder` and the
+ * panel plays the chunks with MSE.
+ *
+ * `capture` exists because the two other lanes each lose the same thing. A DOM
+ * mirror has an element where a `<video>` is and no picture in it, and the
+ * element-level `HTMLMediaElement.captureStream()` that would fix that is
+ * blocked by the same-origin rule for exactly the case that matters - media on
+ * a cross-origin CDN, which is where a page's media almost always is (measured:
+ * `SecurityError` on a same-page cross-origin `file://` media element). Tab
+ * capture goes through the browser's own capture surface instead of the
+ * element, so it is origin-independent.
  */
-export type BrowserViewLane = 'dom' | 'pixels'
+export type BrowserViewLane = 'capture' | 'dom' | 'pixels'
+
+/**
+ * Container/codec the tab capture is recorded and replayed in.
+ *
+ * Part of the wire contract because both halves need the same string: the page
+ * passes it to `MediaRecorder`, the panel passes it to `MediaSource`. No audio
+ * codec appears in it, deliberately: this product has no audio path at all (the
+ * browser is launched with `--mute-audio`, and capture is asked for video only).
+ */
+export const CAPTURE_MIME = 'video/webm;codecs=vp8'
 
 /**
  * Lane a panel renders before it has said anything.
@@ -177,6 +203,36 @@ export type BrowserViewEvent =
       available: boolean
       /** Why the mirror could not start, shown to the person watching. */
       reason?: string
+    }
+  | {
+      v: 1
+      kind: 'capture'
+      /** Tab the capture status belongs to. */
+      tabId: string
+      /** Whether the tab capture is running for that tab. */
+      available: boolean
+      /** Why the capture could not start or stopped, shown to the person watching. */
+      reason?: string
+    }
+  | {
+      v: 1
+      kind: 'capture-chunk'
+      /** Tab the recording belongs to. */
+      tabId: string
+      /** Monotonic per-service counter over chunks, so a slow panel can drop stale ones. */
+      seq: number
+      /**
+       * True when this chunk starts a recording rather than continues one: the
+       * panel discards its media source and rebuilds it from this chunk. Set
+       * for the first chunk of every recording, which is the chunk carrying the
+       * container header (`MediaRecorder.start(200)` emits it first) - a
+       * `SourceBuffer` cannot be appended to from the middle of a stream.
+       */
+      reset?: boolean
+      /** Codec of this recording, so the panel builds its source buffer from it. */
+      mime: string
+      /** Base64 WebM bytes of one recorder chunk, no data: prefix. */
+      data: string
     }
   | { v: 1; kind: 'rtc-answer'; sdp: string }
   | { v: 1; kind: 'error'; code: string; message: string }
@@ -340,7 +396,7 @@ export function isBrowserViewCommand(value: unknown): value is BrowserViewComman
     case 'input':
       return isBrowserInputEvent(candidate.input)
     case 'mode':
-      return candidate.mode === 'dom' || candidate.mode === 'pixels'
+      return candidate.mode === 'dom' || candidate.mode === 'pixels' || candidate.mode === 'capture'
     case 'rtc-offer':
       return typeof candidate.sdp === 'string' && candidate.sdp.length > 0
     case 'stream':

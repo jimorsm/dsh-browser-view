@@ -39,13 +39,29 @@ to this package; the upstream dsh-web monorepo rules do not apply here.
   判定在 `TabManager.dispatchInput`）。契约新增命令类型时版本号保持不变的前提是
   旧面板不会发新命令、新面板对旧 host 只会换来单帧 invalid-command 错误；破坏该
   前提才递增 `BROWSER_VIEW_API_VERSION`。能连 socket 即能发输入，安全模型随围栏。
-- 双通道：面板默认走 **DOM 镜像**（`src/core/mirror.ts` 注入 rrweb 录制器并收集
-  `Runtime.bindingCalled`，`src/client/mirror.ts` 用 rrweb 重放器 live 还原），
-  像素通道保持原样、一键可切，镜像起不来时宿主把它降级回像素并发
-  `mirror{available:false,reason}`（面板显示原因，不是空舞台）。面板用 `mode`
+- 三通道：面板**默认走像素**（`DEFAULT_VIEW_LANE`，也是契约断言），另外两条一键可切：
+  **DOM 镜像**（`src/core/mirror.ts` 注入 rrweb 录制器并收集
+  `Runtime.bindingCalled`，`src/client/mirror.ts` 用 rrweb 重放器 live 还原）与
+  **标签页录制**（`src/core/capture.ts` 先用 `Runtime.evaluate` 把标签页改名成
+  `TAB_CAPTURE_SENTINEL_TITLE`——启动 flag 是按*捕获时刻*的标题匹配的——再取
+  `getDisplayMedia`，`MediaRecorder` 分片经 binding 回传，`src/client/capture.ts`
+  用 MSE 播放）。任一条起不来时宿主把它降级回像素并发 `mirror{available:false,reason}`
+  或 `capture{available:false,reason}`（面板显示原因，不是空舞台）。面板用 `mode`
   命令声明自己渲染哪条通道；**没发过 `mode` 的老面板行为逐字节不变**（宿主默认
-  像素、不注入）。契约面是 `tests/host/service.spec.ts` 的「dom mirror lane」
-  与 `tests/core/mirror.spec.ts`。
+  像素、不注入、不抓取）。契约面是 `tests/host/service.spec.ts` 的「dom mirror lane」
+  与「tab capture lane」、`tests/core/mirror.spec.ts` 与 `tests/core/capture.spec.ts`。
+- 标签页录制四条硬约束，改动前先读 `src/core/capture.ts` 的注释：① 启动必须带
+  `--auto-select-tab-capture-source-by-title=<哨兵>` + `--use-fake-ui-for-media-stream`
+  + `--enable-usermedia-screen-capturing`（`chromeLaunchArgs`），少一个就静默拿不到
+  流；② 标题必须**在取流前**改成哨兵、停止/失败时再按「标题仍是哨兵」条件还原，
+  绝不留哨兵在页面标题上；③ `Runtime.evaluate` 必须带 `userGesture: true`（两次都
+  要），`getDisplayMedia` 无手势必被拒；④ 分片带录制 token，录制被替换后仍在飞的
+  分片要被丢弃，绝不能拼进下一段（MSE 从半截流开始必然失败）。录制**只读**，输入
+  仍只走像素画面；**不采音频**（`audio: false`，浏览器带 `--mute-audio`）。
+- 内存边界：录制分片是唯一「不管面板读不读都一直来」的推送流，所以宿主按
+  `BrowserViewSink.bufferedAmount()`（`ws.bufferedAmount`）判断，超过
+  `CAPTURE_SINK_BUFFER_LIMIT` 就跳过该分片而不是排队；页面侧 `MediaRecorder` 在转换
+  队列超过 `CAPTURE_PAGE_QUEUE_LIMIT` 时暂停、排空后恢复。**不要**给任一侧加无界队列。
 - 镜像注入三条硬约束，改动前先读 `src/core/mirror.ts` 的注释：① 页面域命令必须
   带标签页的 flat session（`TabManager.sessionOf`），浏览器级 socket 上
   `Runtime.*` 会被 `-32601` 拒；② 注入脚本只能在顶层 frame 录制

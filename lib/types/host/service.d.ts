@@ -18,13 +18,14 @@
  * lets one dead socket break the fan-out — a throwing send drops that sink.
  *
  * Lanes. A panel declares which lane it renders (`mode`): the DOM mirror, whose
- * events come from src/core/mirror.ts, or the screencast. The declaration is
- * per sink, so one person can watch pixels while another watches DOM, and it is
- * what keeps a panel from before the mirror existed on exactly the frames it
- * always got. The recorder runs only while some visible sink asks for it, and
- * the screencast runs only while some visible sink still needs pixels — which
- * includes a mirror that has not delivered its first snapshot yet, so switching
- * lanes never shows an empty stage.
+ * events come from src/core/mirror.ts, the tab capture, whose chunks come from
+ * src/core/capture.ts, or the screencast. The declaration is per sink, so one
+ * person can watch pixels while another watches DOM or a capture, and it is what
+ * keeps a panel from before those lanes existed on exactly the frames it always
+ * got. A lane runs only while some visible sink asks for it, and the screencast
+ * runs while some visible sink still needs pixels — which includes a mirror that
+ * has not delivered its first snapshot yet and a capture that has not delivered
+ * its first chunk, so switching lanes never shows an empty stage.
  *
  * @module @jimorsm/dsh-client-ui-browser-view/host/service
  */
@@ -39,6 +40,18 @@ export interface BrowserViewSink {
     send(event: BrowserViewEvent): void;
     /** Close the underlying transport. */
     close(): void;
+    /**
+     * Bytes the transport is still holding for this panel, when it can say.
+     *
+     * Optional because only the capture lane needs it: it is the one lane whose
+     * traffic arrives whether or not the panel is keeping up, and this is how the
+     * host bounds what a slow panel can make it buffer (see
+     * {@link CAPTURE_SINK_BUFFER_LIMIT}). A sink that cannot report stays on the
+     * unbounded-by-design WebSocket send path, which is what every sink did before
+     * this lane existed.
+     * @returns queued bytes, or undefined when the transport cannot report.
+     */
+    bufferedAmount?(): number;
 }
 /** What the route layer needs from the service; tests stub this instead. */
 export interface BrowserViewBackend {
@@ -204,6 +217,29 @@ export declare class BrowserViewService implements BrowserViewBackend {
     /** Batch counter for `dom` events; monotonic per service, not per tab. */
     private domSeq;
     /**
+     * Tabs whose tab capture failed most recently, with the reason. Same memory
+     * and same clearing gesture as `mirrorFailures`: a failed start is not
+     * retried on every state change, and asking for the lane again - the one
+     * gesture that could plausibly have changed the page - clears it.
+     */
+    private readonly captureFailures;
+    /** The tab the tab capture is running for, if any; one capture at a time. */
+    private capturedTabId;
+    /**
+     * Recording generation of the capture lane. Bumped on every start, so a panel
+     * holding an older value knows the stream it was reading has been replaced and
+     * must be rebuilt from a header rather than continued.
+     */
+    private captureGeneration;
+    /**
+     * Whether a recording has started and its header has not been forwarded yet.
+     * While this is true a start must not be repeated for the panels that still
+     * look un-anchored - they are waiting for a chunk that is already on its way.
+     */
+    private captureAnchoring;
+    /** Chunk counter for `capture-chunk` events; monotonic per service. */
+    private captureSeq;
+    /**
      * When the last frame reached any panel, for the frame-interval budget.
      * Starts at the beginning of time, not at zero: a clock whose origin is zero
      * (a test clock, or a monotonic counter) would otherwise have its very first
@@ -222,6 +258,8 @@ export declare class BrowserViewService implements BrowserViewBackend {
     private session;
     /** The DOM mirror over the running session; absent until one starts. */
     private mirror;
+    /** The tab capture over the running session; absent until one starts. */
+    private capture;
     /**
      * The tab the attached panels watch. Kept beside the tab manager instead of
      * read from it because "the page the panel shows" and "the page most recently
@@ -470,8 +508,10 @@ export declare class BrowserViewService implements BrowserViewBackend {
     broadcast(event: BrowserViewEvent): void;
     /**
      * Whether one panel still needs the pixel lane: it asked for pixels, or it
-     * asked for the mirror and has no recording to draw yet. The second half is
-     * what keeps the switch from showing a blank stage while the recorder arms.
+     * asked for a different lane and has nothing to draw yet. The second half is
+     * what keeps the switch from showing a blank stage while the recorder arms -
+     * and it applies to the capture lane exactly as it does to the mirror, because
+     * a media source built from a WebM header is not instant either.
      * @param sink - the panel.
      * @returns true when frames must keep flowing to it.
      */
@@ -479,7 +519,7 @@ export declare class BrowserViewService implements BrowserViewBackend {
     /** One panel's lane record, created on first use. */
     private laneOf;
     /**
-     * Bring both lanes in line with what the visible panels asked for.
+     * Bring every lane in line with what the visible panels asked for.
      *
      * One place, called after every event that can change the answer - a panel
      * attaching, hiding, showing or switching, the watched tab moving, a tab
@@ -523,6 +563,88 @@ export declare class BrowserViewService implements BrowserViewBackend {
      * @param reason - what to show the person watching.
      */
     private failMirror;
+    /**
+     * Start, restart or stop the tab capture to match the visible panels' lanes.
+     *
+     * The capture follows the watched tab exactly like the screencast and the
+     * recorder: a background page nobody renders is never captured. It also has a
+     * third transition the other two lanes do not need - a **restart** - because a
+     * media stream cannot be joined from the middle: a panel that arrives late, or
+     * comes back from being hidden, has no way to start decoding a stream whose
+     * container header it never saw. Restarting the recorder emits a fresh header,
+     * every watching panel rebuilds its media source from it, and the cost is one
+     * chunk of latency for a gesture (a switch, an attach) that happens rarely.
+     */
+    private syncCapture;
+    /** Whether one sink already has a media source of the current generation. */
+    private isCaptureAnchored;
+    /**
+     * The visible panels the capture is running for, on one tab.
+     *
+     * Hidden panels are excluded here and not merely filtered at broadcast time:
+     * they are the reason the whole recording stops when the last one looks away.
+     * @param tabId - the watched tab.
+     * @returns the panels that would draw this tab's capture.
+     */
+    private captureAudience;
+    /**
+     * Arm the capture in one tab.
+     *
+     * Every failure ends in {@link failCapture} rather than in a rejected command:
+     * the panel did not ask a question, it asked for a lane, and the honest answer
+     * is the pixel lane plus the reason. A tab whose capture is known to fail is
+     * not retried until somebody asks for the lane again.
+     * @param tabId - the tab to capture.
+     */
+    private startCapture;
+    /**
+     * Release one tab's capture and forget every cursor describing it.
+     *
+     * The cursors go with it: the recording they point at no longer exists, and a
+     * panel left holding a generation would never be told to rebuild when the
+     * recorder arms again.
+     * @param tabId - the tab to release.
+     */
+    private stopCapture;
+    /**
+     * Recover from a capture whose document a navigation replaced.
+     *
+     * Not a failure and therefore not the pixel-lane fallback: the lane is still
+     * wanted, the recorder simply died with its document. The bookkeeping is
+     * dropped here so every visible panel counts as un-anchored, which keeps the
+     * pixel lane on screen for the moment in between, and the next
+     * {@link syncCapture} arms a fresh recorder in the document that is loading.
+     * If that fresh start fails for a real reason, {@link failCapture} still ends
+     * in pixels with the reason.
+     * @param tabId - the tab whose capture was lost.
+     */
+    private loseCapture;
+    /**
+     * Tell the panels watching one tab that its capture is gone, and move them to
+     * the pixel lane.
+     *
+     * The lane is changed here rather than left to the panel for the same reason
+     * the mirror does it: the host is the side that knows the capture failed, a
+     * panel moved to pixels starts receiving frames on the next broadcast, and the
+     * reason travels with the move so the viewer never gets a blank stage without
+     * an explanation.
+     * @param tabId - the tab whose capture failed.
+     * @param reason - what to show the person watching.
+     */
+    private failCapture;
+    /**
+     * Hand every watching panel one recorder chunk.
+     *
+     * A chunk is a stream, not a value: a panel whose generation is stale gets
+     * `reset` on it and rebuilds its media source, while one that is merely a
+     * chunk behind continues. The queue bound lives here too - a sink whose
+     * transport is already holding more than {@link CAPTURE_SINK_BUFFER_LIMIT}
+     * bytes is skipped for this chunk instead of being queued for, which is what
+     * keeps a panel that stopped reading from growing the host's memory.
+     * @param tabId - the tab the recording belongs to.
+     * @param data - base64 WebM bytes of one chunk.
+     */
+    private broadcastCaptureChunk;
     /** Start or stop the screencast to match what the visible panels need. */
     private syncStreaming;
     /** Deliver one event to one sink, dropping it if the socket is gone. */

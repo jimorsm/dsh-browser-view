@@ -15,10 +15,11 @@
  * no empty strip left to caption.
  *
  * The lane switch needs its own words rather than one label: the control has to
- * name what is on screen now ('panel.mode.dom' / 'panel.mode.pixels'), say what
- * pressing it does ('panel.mode.switch'), and account for a mirror that could
- * not start ('panel.mirror.starting' / 'panel.mirror.unavailable' - the latter
- * is a sentence prefix, because the host's own reason is appended to it).
+ * name what is on screen now ('panel.mode.dom' / 'panel.mode.pixels' /
+ * 'panel.mode.capture'), say what pressing it does ('panel.mode.switch'), and
+ * account for a lane that could not start ('panel.mirror.starting' /
+ * 'panel.capture.starting' and the two '…unavailable' sentence prefixes, because
+ * the host's own reason is appended to each).
  */
 /** Simplified Chinese dictionary (key-set source of truth). */
 export declare const zh: {
@@ -30,12 +31,15 @@ export declare const zh: {
     'panel.toolbar.refresh': string;
     'panel.mode.dom': string;
     'panel.mode.pixels': string;
+    'panel.mode.capture': string;
     'panel.mode.switch': string;
     'panel.frame.alt': string;
     'panel.empty.title': string;
     'panel.empty.hint': string;
     'panel.mirror.starting': string;
     'panel.mirror.unavailable': string;
+    'panel.capture.starting': string;
+    'panel.capture.unavailable': string;
     'panel.error.title': string;
     'panel.trace.idle': string;
     'panel.status.connecting': string;

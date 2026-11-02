@@ -312,6 +312,40 @@
   border-top: 0.5px solid var(--dsw-alias-border-l3);
 }
 
+/* -- Tab capture stage --
+
+   One <video> fed by a MediaSource. The captured surface is whatever the
+   browser composited (measured at 800x446 for a 1280x800 window), so this
+   element letterboxes instead of assuming a size: `object-fit: contain` keeps
+   the aspect ratio while max-width/height keep it inside the column, exactly
+   what the pixel frame's <img> does with the same box. */
+
+.capture {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  height: auto;
+  margin: auto;
+  object-fit: contain;
+  background: var(--dsw-alias-bg-base);
+}
+
+/* Hidden, not unmounted, while the pixel lane still has the stage: the media
+   source is attached to this element and a remount would restart playback. */
+.captureIdle {
+  display: none;
+}
+
+/* Why the capture is not running. Same placement rule as the mirror's notice. */
+.captureNotice {
+  flex: none;
+  padding: 4px 10px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 16px;
+  border-top: 0.5px solid var(--dsw-alias-border-l3);
+}
+
 .empty,
 .error {
   display: flex;

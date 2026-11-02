@@ -22,7 +22,7 @@ export const BROWSER_VIEW_PARTS = {
   toolbar: 'toolbar',
   /** The read-only address display of the streamed page. */
   address: 'address',
-  /** The lane switch: DOM mirror or pixel stream. */
+  /** The lane switch: pixel stream, DOM mirror or tab capture. */
   mode: 'mode',
   /** The controlled browser's tab chips; drawn only when it holds several. */
   tabs: 'tabs',
@@ -34,6 +34,12 @@ export const BROWSER_VIEW_PARTS = {
   mirrorNotice: 'mirror-notice',
   /** Placeholder shown while the mirror is being armed. */
   mirrorStarting: 'mirror-starting',
+  /** The recorded tab capture. */
+  capture: 'capture',
+  /** Why the capture is not running and the pixel lane took over. */
+  captureNotice: 'capture-notice',
+  /** Placeholder shown while the capture is being armed. */
+  captureStarting: 'capture-starting',
   /** Bottom action trace. */
   trace: 'trace',
   /** Connection state marker in the toolbar. */

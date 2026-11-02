@@ -134,6 +134,14 @@ export function socketSink(socket: WebSocket): BrowserViewSink {
         // Already closing; nothing left to release.
       }
     },
+    // The capture lane is the only push stream that arrives whether or not the
+    // panel reads it, so it is the only one that needs to know how far behind
+    // this socket is. `ws` counts what it has accepted but not flushed; the
+    // service stops handing over capture chunks past its ceiling (see
+    // CAPTURE_SINK_BUFFER_LIMIT in ./service.ts).
+    bufferedAmount(): number {
+      return socket.bufferedAmount
+    },
   }
 }
 

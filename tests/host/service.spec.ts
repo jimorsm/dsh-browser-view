@@ -9,8 +9,14 @@ import type { BrowserViewEvent } from '../../src/core/protocol.ts'
 import type { BrowserViewSink } from '../../src/host/service.ts'
 import { createFakeBrowser } from '../helpers/fake-browser.ts'
 
-/** A sink that records every event it is handed. */
-function recordingSink(): { sink: BrowserViewSink; events: BrowserViewEvent[]; closed: () => boolean } {
+/**
+ * A sink that records every event it is handed.
+ * @param bufferedAmount - transport backlog the sink reports, when a test is
+ * about the capture lane's queue bound rather than about delivery.
+ */
+function recordingSink(
+  bufferedAmount?: () => number,
+): { sink: BrowserViewSink; events: BrowserViewEvent[]; closed: () => boolean } {
   const events: BrowserViewEvent[] = []
   let closed = false
   return {
@@ -19,6 +25,7 @@ function recordingSink(): { sink: BrowserViewSink; events: BrowserViewEvent[]; c
     sink: {
       send: (event: BrowserViewEvent) => { events.push(event) },
       close: () => { closed = true },
+      ...(bufferedAmount === undefined ? {} : { bufferedAmount }),
     },
   }
 }
@@ -835,5 +842,377 @@ describe('dom mirror lane', () => {
     // and never armed for the tab nobody is rendering
     expect(browser.transport.callsOf('Page.addScriptToEvaluateOnNewDocument')).toHaveLength(0)
     expect(browser.transport.callsOf('Runtime.addBinding')).toHaveLength(0)
+  })
+})
+
+describe('tab capture lane', () => {
+  /** Binding the injected recorder pushes chunks into. */
+  const BINDING = 'dshBrowserViewTabCapture'
+
+  /** Every evaluate whose expression contains one string. */
+  function evaluates(
+    transport: ReturnType<typeof createFakeBrowser>['transport'],
+    needle: string,
+  ): ReturnType<typeof transport.callsOf> {
+    return transport.callsOf('Runtime.evaluate').filter(call => String(call.params.expression).includes(needle))
+  }
+
+  /** Every evaluate that asked the page for the tab's surface. */
+  const startCalls = (transport: ReturnType<typeof createFakeBrowser>['transport']): ReturnType<typeof transport.callsOf> =>
+    evaluates(transport, 'getDisplayMedia')
+
+  /** Every evaluate that released a capture. */
+  const stopCalls = (transport: ReturnType<typeof createFakeBrowser>['transport']): ReturnType<typeof transport.callsOf> =>
+    evaluates(transport, 'capture.recorder')
+
+  /** Every evaluate that touched the capture title. */
+  const titleCalls = (transport: ReturnType<typeof createFakeBrowser>['transport']): ReturnType<typeof transport.callsOf> =>
+    evaluates(transport, 'SENTINEL')
+
+  /** The token the recorder running now was handed, read off the page expression. */
+  function startedToken(transport: ReturnType<typeof createFakeBrowser>['transport']): string {
+    const call = startCalls(transport).at(-1)
+    const match = /var TOKEN = "([^"]+)"/.exec(String(call?.params.expression ?? ''))
+    if (match === null) throw new Error('the capture bootstrap carried no token')
+    return match[1]
+  }
+
+  /** Deliver one recorder chunk the way the page's binding does. */
+  function emitChunk(
+    transport: ReturnType<typeof createFakeBrowser>['transport'],
+    data: string,
+    sessionId = 'session-1',
+  ): void {
+    transport.emit('Runtime.bindingCalled', {
+      name: BINDING,
+      payload: JSON.stringify({ chunk: data, token: startedToken(transport) }),
+      executionContextId: 1,
+    }, sessionId)
+  }
+
+  /** The capture chunks one sink received, in order. */
+  function chunksOf(sink: { events: BrowserViewEvent[] }): Array<{ data: string; reset?: boolean }> {
+    return sink.events.filter(event => event.kind === 'capture-chunk') as Array<{ data: string; reset?: boolean }>
+  }
+
+  /** Make the page refuse the capture, leaving every other evaluate answer alone. */
+  function refuseCapture(
+    transport: ReturnType<typeof createFakeBrowser>['transport'],
+    description: string,
+  ): void {
+    const base = transport.responses.get('Runtime.evaluate')
+    transport.responses.set('Runtime.evaluate', (params: Record<string, unknown>) => {
+      if (String(params.expression ?? '').includes('getDisplayMedia')) {
+        return { exceptionDetails: { text: 'Uncaught', exception: { description } } }
+      }
+      return typeof base === 'function' ? base(params) : base
+    })
+  }
+
+  it('a panel asks for the capture lane and the watched tab is renamed then armed on its own session', async () => {
+    // Given one open tab and an attached panel
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    browser.transport.calls.length = 0
+
+    // When the panel asks for the capture
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'capture' })
+
+    // Then the title is changed to the sentinel before the surface is asked
+    // for, both calls ride the tab's own page session and both take the user
+    // gesture getDisplayMedia requires
+    expect(titleCalls(browser.transport)).toHaveLength(1)
+    expect(browser.transport.calls.indexOf(titleCalls(browser.transport)[0] as never))
+      .toBeLessThan(browser.transport.calls.indexOf(startCalls(browser.transport)[0] as never))
+    expect(startCalls(browser.transport)[0]?.params.userGesture).toBe(true)
+    expect(startCalls(browser.transport)[0]?.params.awaitPromise).toBe(true)
+    expect(evaluates(browser.transport, 'SENTINEL')[0]?.sessionId).toBe('session-1')
+    expect(browser.transport.callsOf('Runtime.addBinding')[0]?.params.name).toBe(BINDING)
+    expect(startCalls(browser.transport)).toHaveLength(1)
+  })
+
+  it('a panel that never asks for a lane captures nothing', async () => {
+    // Given one open tab and an attached panel that says nothing about lanes
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // When the panel models the default behaviour
+    // Then no capture was ever requested, so a panel that never wanted one
+    // costs the page no display-capture permission and no recorder
+    expect(startCalls(browser.transport)).toHaveLength(0)
+    expect(titleCalls(browser.transport)).toHaveLength(0)
+  })
+
+  it('a capturing panel receives a header chunk and stops paying for frames', async () => {
+    // Given a panel on the capture lane
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'capture' })
+    alice.events.length = 0
+
+    // When the recorder emits its first chunk and then a following one
+    emitChunk(browser.transport, 'HEADER')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    emitChunk(browser.transport, 'CLUSTER')
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Then the first carries `reset` - it is a stream header, not a fragment -
+    // and the second continues the recording without one
+    expect(chunksOf(alice)).toEqual([
+      { v: 1, kind: 'capture-chunk', tabId: 'tab-1', seq: expect.any(Number), mime: 'video/webm;codecs=vp8', reset: true, data: 'HEADER' },
+      { v: 1, kind: 'capture-chunk', tabId: 'tab-1', seq: expect.any(Number), mime: 'video/webm;codecs=vp8', data: 'CLUSTER' },
+    ])
+    // And the pixel lane stopped once the panel had a picture of its own
+    expect(browser.transport.callsOf('Page.stopScreencast')).toHaveLength(1)
+  })
+
+  it('a panel that attaches late restarts the recording so it gets a header of its own', async () => {
+    // Given one panel already drawing the capture
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    const bob = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'capture' })
+    emitChunk(browser.transport, 'HEADER')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(chunksOf(alice)).toHaveLength(1)
+
+    // When a second panel asks for the same lane
+    browser.service.attach(bob.sink)
+    await browser.service.handleCommand(bob.sink, { v: 1, kind: 'mode', mode: 'capture' })
+    emitChunk(browser.transport, 'HEADER-2')
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Then the recorder was restarted rather than continued, because a media
+    // stream cannot be joined from the middle: the late panel's first chunk
+    // starts a recording
+    expect(startCalls(browser.transport).length).toBeGreaterThanOrEqual(2)
+    expect(chunksOf(bob)[0]).toMatchObject({ reset: true, data: 'HEADER-2' })
+  })
+
+  it('no capture runs while every sink is paused', async () => {
+    // Given one panel capturing a tab
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'capture' })
+    emitChunk(browser.transport, 'HEADER')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const token = startedToken(browser.transport)
+    browser.transport.calls.length = 0
+    alice.events.length = 0
+
+    // When it reports itself hidden, the only watcher gone
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'stream', enabled: false })
+
+    // Then the capture is released in the page and the sentinel comes off the
+    // title: nobody is looking, and a capture running for nobody is also a tab
+    // wearing a title it did not choose
+    expect(stopCalls(browser.transport).length).toBeGreaterThan(0)
+    expect(titleCalls(browser.transport).length).toBeGreaterThan(0)
+
+    // And a chunk the page still had in flight is not delivered to it
+    browser.transport.emit('Runtime.bindingCalled', {
+      name: BINDING,
+      payload: JSON.stringify({ chunk: 'LATE', token }),
+      executionContextId: 1,
+    }, 'session-1')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(chunksOf(alice)).toHaveLength(0)
+  })
+
+  it('a panel that comes back starts a fresh recording instead of a fragment', async () => {
+    // Given a hidden panel that was on the capture lane before
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'capture' })
+    emitChunk(browser.transport, 'HEADER')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'stream', enabled: false })
+    browser.transport.calls.length = 0
+    alice.events.length = 0
+
+    // When it becomes visible again
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'stream', enabled: true })
+    emitChunk(browser.transport, 'FRESH')
+
+    // Then a recorder was armed again - the stream it missed cannot be resumed
+    // mid-way - and its first chunk is marked as the start of a recording
+    expect(startCalls(browser.transport).length).toBeGreaterThan(0)
+    expect(chunksOf(alice)[0]).toMatchObject({ reset: true, data: 'FRESH' })
+  })
+
+  it('the capture cannot start and the panel is moved to pixels with the reason', async () => {
+    // Given a page that refuses the display-capture request
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    refuseCapture(browser.transport, 'NotAllowedError: permission denied')
+    alice.events.length = 0
+
+    // When the panel asks for the capture lane
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'capture' })
+
+    // Then it is told why, the host moves it to pixels and a frame follows so
+    // the stage is never empty, and the sentinel was taken back off the page
+    const notice = alice.events.find(event => event.kind === 'capture')
+    expect(notice).toMatchObject({ v: 1, kind: 'capture', tabId: 'tab-1', available: false })
+    expect((notice as { reason: string }).reason).toMatch(/permission denied/)
+    expect(titleCalls(browser.transport).length).toBeGreaterThanOrEqual(2)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'request-frame' })
+    expect(alice.events.filter(event => event.kind === 'frame').length).toBeGreaterThan(0)
+  })
+
+  it('the capture cannot start and the host does not retry it on every state change', async () => {
+    // Given a capture whose start always fails
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    refuseCapture(browser.transport, 'NotAllowedError: permission denied')
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'capture' })
+    const attempts = startCalls(browser.transport).length
+
+    // When the tab changes state repeatedly
+    await browser.transport.emit('Page.frameStartedLoading', {}, 'session-1')
+    await browser.transport.emit('Page.loadEventFired', {}, 'session-1')
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Then no second doomed request was made
+    expect(startCalls(browser.transport)).toHaveLength(attempts)
+  })
+
+  it('a panel switches back to pixels and the capture is released', async () => {
+    // Given a capturing panel
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'capture' })
+    emitChunk(browser.transport, 'HEADER')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    browser.transport.calls.length = 0
+    alice.events.length = 0
+
+    // When it asks for pixels
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'pixels' })
+
+    // Then the recorder and the tracks are released, the title goes back and a
+    // fresh frame follows so the panel has a picture immediately
+    expect(stopCalls(browser.transport).length).toBeGreaterThan(0)
+    expect(titleCalls(browser.transport).length).toBeGreaterThan(0)
+    expect(browser.transport.callsOf('Page.startScreencast').length).toBeGreaterThan(0)
+    expect(alice.events.filter(event => event.kind === 'frame')).toHaveLength(1)
+  })
+
+  it('the recorder dies inside the page and the panel falls back with the reason', async () => {
+    // Given a panel drawing a live capture
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'capture' })
+    emitChunk(browser.transport, 'HEADER')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    alice.events.length = 0
+
+    // When the page reports that its capture stopped
+    browser.transport.emit('Runtime.bindingCalled', {
+      name: BINDING,
+      payload: JSON.stringify({ __dshCaptureError: 'the tab capture ended', token: startedToken(browser.transport) }),
+      executionContextId: 1,
+    }, 'session-1')
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Then the panel is moved to pixels with that reason rather than left on a
+    // frozen last frame, and the title is restored
+    expect(alice.events.find(event => event.kind === 'capture'))
+      .toMatchObject({ v: 1, kind: 'capture', tabId: 'tab-1', available: false })
+    expect((alice.events.find(event => event.kind === 'capture') as { reason: string }).reason)
+      .toMatch(/the tab capture ended/)
+    expect(titleCalls(browser.transport).length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('the watched page navigates and the capture is re-armed instead of falling back', async () => {
+    // Given a panel drawing a live capture
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'capture' })
+    emitChunk(browser.transport, 'HEADER')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    alice.events.length = 0
+
+    // When the page navigates, which destroys the document the recorder lives in
+    browser.transport.emit('Page.frameNavigated', { frame: { url: 'https://b.test/', loaderId: 'loader-2' } }, 'session-1')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Then a fresh recorder was armed in the new document, the panel was not
+    // demoted to pixels - the lane is still what the person asked for - and the
+    // pixel lane covered the gap while it armed
+    expect(startCalls(browser.transport).length).toBeGreaterThanOrEqual(2)
+    expect(alice.events.filter(event => event.kind === 'capture')).toHaveLength(0)
+
+    // And the next chunk from the new recording starts one
+    emitChunk(browser.transport, 'HEADER-2')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(chunksOf(alice).at(-1)).toMatchObject({ reset: true, data: 'HEADER-2' })
+  })
+
+  it('a sink whose transport is already backed up is skipped instead of queued for', async () => {
+    // Given one panel whose socket is already holding more than the ceiling and
+    // one that is keeping up
+    const browser = createFakeBrowser()
+    const slow = recordingSink(() => 8 * 1024 * 1024)
+    const fast = recordingSink(() => 0)
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(slow.sink)
+    browser.service.attach(fast.sink)
+    await browser.service.handleCommand(slow.sink, { v: 1, kind: 'mode', mode: 'capture' })
+    await browser.service.handleCommand(fast.sink, { v: 1, kind: 'mode', mode: 'capture' })
+    slow.events.length = 0
+    fast.events.length = 0
+
+    // When the recorder emits a chunk
+    emitChunk(browser.transport, 'HEADER')
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Then the backed-up panel is not handed another byte - a slow reader must
+    // not make the host buffer without bound - while the healthy one still gets it
+    expect(chunksOf(slow)).toHaveLength(0)
+    expect(chunksOf(fast)).toHaveLength(1)
+  })
+
+  it('a tab nobody watches is not captured even when a panel wants the lane', async () => {
+    // Given two tabs and a panel pinned to the first while on the capture lane
+    const browser = createFakeBrowser()
+    const alice = recordingSink()
+    const first = await browser.service.ensureTab('session-a')
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'attach' })
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'select-tab', tabId: first.id })
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'capture' })
+    browser.transport.calls.length = 0
+
+    // When the agent opens a second tab while the panel stays on the first
+    await browser.service.ensureTab('session-b')
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Then no capture was armed for the tab nobody is rendering
+    expect(startCalls(browser.transport)).toHaveLength(0)
   })
 })
