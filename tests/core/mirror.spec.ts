@@ -158,11 +158,18 @@ describe('arming the recorder', () => {
         'Page.addScriptToEvaluateOnNewDocument:session-1',
         'Runtime.addBinding:session-1',
         'Runtime.evaluate:session-1',
+        // One explicit re-snapshot after registration: a recorder armed by the
+        // new-document script can have emitted its whole snapshot before this
+        // session existed, and arming must still end with a drawable checkpoint.
+        'Runtime.evaluate:session-1',
       ])
       expect(transport.lastCall('Runtime.addBinding')?.params.name).toBe(MIRROR_BINDING_NAME)
-      // The bootstrap carries the same source the new-document registration got.
+      // The bootstrap carries the same source the new-document registration got;
+      // the second evaluate after it is the re-snapshot request.
       const registered = String(transport.lastCall('Page.addScriptToEvaluateOnNewDocument')?.params.source)
-      expect(String(transport.lastCall('Runtime.evaluate')?.params.expression)).toBe(registered)
+      const evaluates = transport.callsOf('Runtime.evaluate').map(call => String(call.params.expression))
+      expect(evaluates[0]).toBe(registered)
+      expect(evaluates[1]).toContain('takeFullSnapshot')
     })
   })
 

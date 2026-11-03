@@ -47,6 +47,12 @@ export function createFakeBrowser(options: {
   createRelay?: () => FrameRelay
   /** Recorder bundle the mirror injects; a stub by default. */
   mirrorSource?: () => string
+  /**
+   * The `auto` lane's media probe verdict. A stub answering "no media" by
+   * default: a page with media is the capture lane's business and is stated
+   * per test, not assumed.
+   */
+  mediaProbe?: () => boolean
 } = {}): FakeBrowser {
   const transport = new FakeTransport()
   let tabCounter = 0
@@ -59,6 +65,11 @@ export function createFakeBrowser(options: {
   transport.responses.set('Page.addScriptToEvaluateOnNewDocument', () => ({ identifier: 'mirror-script' }))
   transport.responses.set('Runtime.evaluate', (params: Record<string, unknown>) => {
     const expression = String(params.expression ?? '')
+    // The `auto` lane's probe comes first: it also contains
+    // `document.querySelector`, so the order here is load-bearing.
+    if (expression.includes("querySelector('video')")) {
+      return { result: { value: options.mediaProbe?.() ?? false } }
+    }
     // The mirror's bootstrap answers with the verdict the host reads, not with
     // page data.
     if (expression.includes('dshBrowserViewDomMirror')) return { result: { value: 'ok' } }

@@ -388,25 +388,12 @@ export class DomMirror {
     // inside its own constructor, and an emit into a missing binding is a
     // TypeError inside the observed page.
     await this.transport.send('Runtime.addBinding', { name: this.bindingName }, sessionId)
-    const result = await this.transport.send<{
-      exceptionDetails?: { text?: unknown; exception?: { description?: unknown } }
-      result?: { value?: unknown }
-    }>('Runtime.evaluate', {
-      expression: injection,
-      returnByValue: true,
-      awaitPromise: false,
-    }, sessionId)
-    const failure = describeInjection(result)
-    if (failure !== undefined) {
-      if (typeof registered.identifier === 'string') {
-        await this.transport.send(
-          'Page.removeScriptToEvaluateOnNewDocument',
-          { identifier: registered.identifier },
-          sessionId,
-        ).catch(() => undefined)
-      }
-      throw new Error(failure)
-    }
+    // Registered before the recorder is started, not after: the events the
+    // recorder emits race this very call. The `evaluate` below is what starts
+    // recording in the document that is loaded right now, and its snapshot
+    // travels back as protocol events that can arrive before this promise
+    // resolves - events a session registered any later would be dropped whole,
+    // exactly the checkpoint a quiet page then never replaces.
     const session: MirrorSession = {
       sessionId,
       scriptId: typeof registered.identifier === 'string' ? registered.identifier : undefined,
@@ -417,6 +404,40 @@ export class DomMirror {
     }
     this.sessions.set(tabId, session)
     this.tabBySession.set(sessionId, tabId)
+    const result = await this.transport.send<{
+      exceptionDetails?: { text?: unknown; exception?: { description?: unknown } }
+      result?: { value?: unknown }
+    }>('Runtime.evaluate', {
+      expression: injection,
+      returnByValue: true,
+      awaitPromise: false,
+    }, sessionId)
+    const failure = describeInjection(result)
+    if (failure !== undefined) {
+      this.sessions.delete(tabId)
+      this.tabBySession.delete(sessionId)
+      if (typeof registered.identifier === 'string') {
+        await this.transport.send(
+          'Page.removeScriptToEvaluateOnNewDocument',
+          { identifier: registered.identifier },
+          sessionId,
+        ).catch(() => undefined)
+      }
+      throw new Error(failure)
+    }
+    // A recorder armed by the new-document script can have emitted its whole
+    // snapshot before any session existed to receive it - the exact case of
+    // arming during a navigation. One explicit re-snapshot after registration
+    // guarantees a drawable checkpoint; rrweb tolerates the duplicate, because
+    // the anchor logic keeps only the newest one. The method is guarded rather
+    // than assumed: an rrweb upgrade that renames it must degrade to the old
+    // behaviour, not break the arm.
+    await this.transport.send('Runtime.evaluate', {
+      expression: 'try { typeof window.__dshBrowserViewRrweb'
+        + '?.takeFullSnapshot === "function"'
+        + ' && window.__dshBrowserViewRrweb.takeFullSnapshot(false) } catch (ignored) {} true',
+      returnByValue: true,
+    }, sessionId).catch(() => undefined)
   }
 
   /** Route one binding payload into the tab that owns its session. */

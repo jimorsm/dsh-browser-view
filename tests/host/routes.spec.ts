@@ -369,3 +369,28 @@ describe('the stream command through the frame gate', () => {
     expect(events.filter(event => event.kind === 'error').length).toBe(1)
   })
 })
+
+describe('the mode command through the frame gate', () => {
+  it('auto is an accepted lane and reaches the backend', async () => {
+    // Given a stub backend
+    const backend = new StubBackend()
+    const { sink } = recordingSink()
+    // When the panel asks for the auto lane
+    const command = { v: 1, kind: 'mode', mode: 'auto' } as const
+    const next = await handleClientFrame(backend, sink, JSON.stringify(command), false)
+    // Then the gate accepts it: a version-1 contract grew without a bump
+    expect(next).toBe('accept')
+    expect(backend.commands).toEqual([command])
+  })
+
+  it('an unknown lane is refused with an error event', async () => {
+    // Given a stub backend
+    const backend = new StubBackend()
+    const { events, sink } = recordingSink()
+    // When the lane is not one the contract knows
+    await handleClientFrame(backend, sink, JSON.stringify({ v: 1, kind: 'mode', mode: 'hologram' }), false)
+    // Then the gate refuses it
+    expect(backend.commands).toEqual([])
+    expect(events.filter(event => event.kind === 'error').length).toBe(1)
+  })
+})

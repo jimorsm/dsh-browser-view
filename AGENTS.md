@@ -39,16 +39,21 @@ to this package; the upstream dsh-web monorepo rules do not apply here.
   判定在 `TabManager.dispatchInput`）。契约新增命令类型时版本号保持不变的前提是
   旧面板不会发新命令、新面板对旧 host 只会换来单帧 invalid-command 错误；破坏该
   前提才递增 `BROWSER_VIEW_API_VERSION`。能连 socket 即能发输入，安全模型随围栏。
-- 三通道：面板**默认走像素**（`DEFAULT_VIEW_LANE`，也是契约断言），另外两条一键可切：
-  **DOM 镜像**（`src/core/mirror.ts` 注入 rrweb 录制器并收集
+- 四通道：面板**默认走 auto**（`DEFAULT_VIEW_LANE`）——宿主对被观看标签页用一次
+  `Runtime.evaluate` 探测文档里有没有镜像画不出的媒体（`<video>` 按存在计；canvas 需
+  ≥64×64 的布局盒，隐藏的 0×0 探测 canvas 不算），有媒体解析到录制、没有解析到镜像，
+  并在被观看标签页每次顶层导航（`Page.frameNavigated`，service 自行订阅）时重新解析，
+  绝不轮询；解析结果经新增的 `lane` 事件告知面板，开关文案随之标注。解析出的通道失败
+  时按既有逐通道回退路径降级到像素（带原因），**绝不横向掉进另一条解析通道**。
+  手动选的通道始终优先，直到面板再次选 auto；没发过 `mode` 的面板现在得到 auto
+  （这正是默认值改为 auto 的目的）。另外三条一键可切：**DOM 镜像**（`src/core/mirror.ts` 注入 rrweb 录制器并收集
   `Runtime.bindingCalled`，`src/client/mirror.ts` 用 rrweb 重放器 live 还原）与
   **标签页录制**（`src/core/capture.ts` 先用 `Runtime.evaluate` 把标签页改名成
   `TAB_CAPTURE_SENTINEL_TITLE`——启动 flag 是按*捕获时刻*的标题匹配的——再取
   `getDisplayMedia`，`MediaRecorder` 分片经 binding 回传，`src/client/capture.ts`
   用 MSE 播放）。任一条起不来时宿主把它降级回像素并发 `mirror{available:false,reason}`
   或 `capture{available:false,reason}`（面板显示原因，不是空舞台）。面板用 `mode`
-  命令声明自己渲染哪条通道；**没发过 `mode` 的老面板行为逐字节不变**（宿主默认
-  像素、不注入、不抓取）。契约面是 `tests/host/service.spec.ts` 的「dom mirror lane」
+  命令声明自己渲染哪条通道（`auto` 也是其中之一）。契约面是 `tests/host/service.spec.ts` 的「dom mirror lane」
   与「tab capture lane」、`tests/core/mirror.spec.ts` 与 `tests/core/capture.spec.ts`。
 - 标签页录制四条硬约束，改动前先读 `src/core/capture.ts` 的注释：① 启动必须带
   `--auto-select-tab-capture-source-by-title=<哨兵>` + `--use-fake-ui-for-media-stream`

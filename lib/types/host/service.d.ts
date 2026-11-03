@@ -19,13 +19,19 @@
  *
  * Lanes. A panel declares which lane it renders (`mode`): the DOM mirror, whose
  * events come from src/core/mirror.ts, the tab capture, whose chunks come from
- * src/core/capture.ts, or the screencast. The declaration is per sink, so one
- * person can watch pixels while another watches DOM or a capture, and it is what
- * keeps a panel from before those lanes existed on exactly the frames it always
- * got. A lane runs only while some visible sink asks for it, and the screencast
- * runs while some visible sink still needs pixels — which includes a mirror that
- * has not delivered its first snapshot yet and a capture that has not delivered
- * its first chunk, so switching lanes never shows an empty stage.
+ * src/core/capture.ts, or the screencast. It can also ask for `auto` - the
+ * default - and then the host decides per page: one cheap `Runtime.evaluate`
+ * probe on the watched tab resolves media to the capture and anything else to
+ * the mirror, again on every navigation of the watched tab, and never on an
+ * interval. The declaration is per sink, so one person can watch pixels while
+ * another watches DOM or a capture, and it is what keeps a panel from before
+ * those lanes existed on exactly the lanes it can render. A lane runs only
+ * while some visible sink asks for it, and the screencast runs while some
+ * visible sink still needs pixels - which includes a mirror that has not
+ * delivered its first snapshot yet, a capture that has not delivered its first
+ * chunk, and an `auto` sink whose resolution has not landed, so switching
+ * lanes never shows an empty stage. A resolved lane that fails falls back to
+ * pixels with the reason - never sideways into the other lane a probe guessed.
  *
  * @module @jimorsm/dsh-client-ui-browser-view/host/service
  */
@@ -214,6 +220,13 @@ export declare class BrowserViewService implements BrowserViewBackend {
     private readonly mirrorFailures;
     /** The tab the recorder is running for, if any; one mirror at a time. */
     private mirroredTabId;
+    /**
+     * The media verdict per tab, from the `auto` probe. One verdict per page, not
+     * per probe call: every `auto` sink resolving against the same document shares
+     * one `Runtime.evaluate`, and the entry is dropped on navigation so the next
+     * page is probed, not assumed.
+     */
+    private readonly mediaProbes;
     /** Batch counter for `dom` events; monotonic per service, not per tab. */
     private domSeq;
     /**
@@ -516,6 +529,22 @@ export declare class BrowserViewService implements BrowserViewBackend {
      * @returns true when frames must keep flowing to it.
      */
     private needsPixels;
+    /**
+     * Resolve every visible `auto` sink against the watched page.
+     *
+     * One probe per page, shared by every `auto` sink: they all watch the same
+     * tab, so asking the document once is once. The verdict is cached per tab and
+     * dropped on navigation, so a page is probed when a panel arrives or asks -
+     * never on an interval. A probe that fails reads as "no media": the mirror is
+     * the cheaper wrong answer, and its own failure path still lands in pixels.
+     */
+    private resolveAutoLanes;
+    /**
+     * Whether the watched document carries media the mirror cannot draw.
+     * @param tabId - the watched tab.
+     * @returns the page's verdict, cached until its next navigation.
+     */
+    private probeMedia;
     /** One panel's lane record, created on first use. */
     private laneOf;
     /**
@@ -563,6 +592,20 @@ export declare class BrowserViewService implements BrowserViewBackend {
      * @param reason - what to show the person watching.
      */
     private failMirror;
+    /**
+     * Re-resolve the `auto` sinks after the watched tab navigated.
+     *
+     * The probe verdict belongs to one document: a navigation is the one moment
+     * the answer can legitimately flip, so the cached verdict and the failure
+     * memories die with the old page and every `auto` sink goes back to
+     * unresolved. It stays that way only for the moment between this event and
+     * the next sync - pixels cover the gap, because an unresolved lane is a
+     * needs-pixels lane. Manual lanes are untouched: a person who picked a lane
+     * picked it for more than one page.
+     * @param sessionId - the session the navigation event arrived on.
+     * @param params - the `Page.frameNavigated` params.
+     */
+    private onWatchedNavigation;
     /**
      * Start, restart or stop the tab capture to match the visible panels' lanes.
      *

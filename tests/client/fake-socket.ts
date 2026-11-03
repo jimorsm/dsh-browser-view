@@ -11,6 +11,7 @@ import type {
   BrowserViewCaptureStatus,
   BrowserViewDomBatch,
   BrowserViewFrame,
+  BrowserViewLaneResolution,
   BrowserViewMirrorStatus,
   BrowserViewSocket,
   BrowserViewSocketHandlers,
@@ -33,6 +34,7 @@ export interface FakeSocket {
   pushDom(batch: BrowserViewDomBatch): void
   pushMirror(status: BrowserViewMirrorStatus): void
   pushCapture(status: BrowserViewCaptureStatus): void
+  pushLane(resolution: BrowserViewLaneResolution): void
   pushCaptureChunk(chunk: BrowserViewCaptureChunk): void
   pushError(code: string, message: string): void
   pushStatus(status: BrowserViewSocketStatus): void
@@ -83,6 +85,9 @@ export function createFakeSockets(): FakeSocketFixture {
       },
       pushCapture(status: BrowserViewCaptureStatus): void {
         handlers.onCapture?.(status)
+      },
+      pushLane(resolution: BrowserViewLaneResolution): void {
+        handlers.onLane?.(resolution)
       },
       pushCaptureChunk(chunk: BrowserViewCaptureChunk): void {
         handlers.onCaptureChunk?.(chunk)

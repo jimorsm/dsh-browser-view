@@ -22,7 +22,7 @@ export const BROWSER_VIEW_PARTS = {
   toolbar: 'toolbar',
   /** The read-only address display of the streamed page. */
   address: 'address',
-  /** The lane switch: pixel stream, DOM mirror or tab capture. */
+  /** The lane switch: auto (resolved per page), pixel stream, DOM mirror or tab capture. */
   mode: 'mode',
   /** The controlled browser's tab chips; drawn only when it holds several. */
   tabs: 'tabs',
