@@ -132,6 +132,12 @@ export declare class TabManager {
     /** Internal record access for the layers that need the CDP session. */
     sessionOf(tabId: string): string;
     /**
+     * The tab one flat CDP session belongs to, when it is one of ours.
+     * @param sessionId - flat session id from a protocol event.
+     * @returns the tab id, or undefined for a session this manager did not open.
+     */
+    tabOfSession(sessionId: string): string | undefined;
+    /**
      * Create one tab and instrument it.
      * @param options - url to open and the session that asked for it.
      * @returns the new tab as the panel sees it.

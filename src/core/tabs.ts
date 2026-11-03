@@ -243,8 +243,18 @@ export class TabManager {
   /** Internal record access for the layers that need the CDP session. */
   sessionOf(tabId: string): string {
     const record = this.tabs.get(tabId)
-    if (record === undefined) throw new Error(`unknown tab "${tabId}"; call browser_tabs to see the open tabs`)
+    if (record === undefined) throw new Error(`unknown tab "${tabId}"; call browser_tabs to see the tab list`)
     return record.sessionId
+  }
+
+  /**
+   * The tab one flat CDP session belongs to, when it is one of ours.
+   * @param sessionId - flat session id from a protocol event.
+   * @returns the tab id, or undefined for a session this manager did not open.
+   */
+  tabOfSession(sessionId: string): string | undefined {
+    const record = this.bySession.get(sessionId)
+    return record === undefined ? undefined : record.id
   }
 
   /**

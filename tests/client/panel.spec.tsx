@@ -150,7 +150,7 @@ function mountPanel(
 
 /**
  * Mount the body and put it on the capture lane, which takes two presses of the
- * cycling switch (pixels -> dom -> capture). The switch only works once the host
+ * cycling switch (auto -> dom -> capture). The switch only works once the host
  * has reported a page, so this reports one.
  * @param dictionary - copy to render with.
  * @param overrides - player factory override.
@@ -177,8 +177,9 @@ function captureStage(mounted: RenderedTree): HTMLVideoElement | null {
 }
 
 /**
- * Mount the body and put it on the mirror lane, which is no longer the default.
- * The switch only works once the host has reported a page, so this reports one.
+ * Mount the body and put it on the mirror lane, one press away from the auto
+ * default. The switch only works once the host has reported a page, so this
+ * reports one.
  * @param dictionary - copy to render with.
  * @param overrides - replayer factory override.
  * @returns the mounted tree, already asking the host for the mirror.
@@ -491,23 +492,95 @@ describe('browser view tab body', () => {
 })
 
 describe('browser view lane switch and DOM mirror', () => {
-  it('user opens the panel and the pixel lane is the lane it asks for', () => {
+  it('user opens the panel and the auto lane is the lane it asks for', () => {
     // Given a mounted body that has not reached the host yet
     const mounted = mountPanel()
 
     // When the socket reports its connection open
     actOn(() => { sockets.latest().pushStatus('open') })
 
-    // Then the host is asked for the lane that draws any page, not for the
-    // mirror nobody asked for, and the switch shows which lane is on
-    expect(sockets.latest().sent).toContainEqual({ v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'pixels' })
+    // Then the host is asked for the page's own lane rather than a fixed one,
+    // and the switch says auto until the resolution names itself
+    expect(sockets.latest().sent).toContainEqual({ v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'auto' })
     const mode = mounted.container.querySelector('[data-dsh-part="mode"]')
-    expect(mode?.getAttribute('data-mode')).toBe('pixels')
-    expect(mode?.textContent).toBe(zh['panel.mode.pixels'])
+    expect(mode?.getAttribute('data-mode')).toBe('auto')
+    expect(mode?.textContent).toBe(zh['panel.mode.auto'])
+  })
+
+  it('the host resolves auto and the switch names the lane the page got', async () => {
+    // Given a mounted body on the auto lane with a page open
+    const mounted = mountPanel()
+    actOn(() => {
+      sockets.latest().pushStatus('open')
+      sockets.latest().pushState(stateWithTab)
+    })
+
+    // When the host resolves that page to the mirror
+    actOn(() => { sockets.latest().pushLane({ tabId: 'tab-1', lane: 'dom' }) })
+    expect(mounted.container.querySelector('[data-dsh-part="mode"]')?.textContent)
+      .toBe(zh['panel.mode.auto.mirror'])
+
+    // Then the mirror it names is the stage that actually mounts
+    await actAsync(() => {
+      sockets.latest().pushDom({ tabId: 'tab-1', seq: 1, reset: true, events: [{ type: 2 }] })
+    })
+    expect(mirrors.created).toHaveLength(1)
+    expect(mounted.container.querySelector('[data-dsh-part="mirror"]')).not.toBeNull()
+  })
+
+  it('the host resolves auto to pixels after a failure and the switch says so with the reason', () => {
+    // Given a mounted body on the auto lane with a page open
+    const mounted = mountPanel()
+    actOn(() => {
+      sockets.latest().pushStatus('open')
+      sockets.latest().pushState(stateWithTab)
+    })
+
+    // When the host reports the mirror unavailable, which is how a failed
+    // auto resolution reaches the panel
+    actOn(() => {
+      sockets.latest().pushMirror({ tabId: 'tab-1', available: false, reason: 'the page forbids eval' })
+    })
+
+    // Then the stage is pixels, the label names the resolution, the reason is
+    // on screen, and the ask stayed auto - the host is not asked for pixels,
+    // because it is still resolving for this panel
+    const mode = mounted.container.querySelector('[data-dsh-part="mode"]')
+    expect(mode?.getAttribute('data-mode')).toBe('auto')
+    expect(mode?.textContent).toBe(zh['panel.mode.auto.pixels'])
+    expect(mounted.container.querySelector('[data-dsh-part="mirror-notice"]')?.textContent)
+      .toContain('the page forbids eval')
+    expect(sockets.latest().sent.filter(command => command.kind === 'mode'))
+      .toEqual([{ v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'auto' }])
+  })
+
+  it('a person who picks a lane over the auto resolution keeps it', () => {
+    // Given a mounted body whose auto lane the host resolved to the mirror
+    const mounted = mountPanel()
+    actOn(() => {
+      sockets.latest().pushStatus('open')
+      sockets.latest().pushState(stateWithTab)
+    })
+    actOn(() => { sockets.latest().pushLane({ tabId: 'tab-1', lane: 'dom' }) })
+
+    // When the person presses the switch once, picking the mirror themselves
+    const mode = mounted.container.querySelector('[data-dsh-part="mode"]') as HTMLButtonElement
+    actOn(() => { mode.click() })
+
+    // Then the pick is on screen and a later resolution for the stale auto
+    // ask is ignored - manual override wins until auto is picked again
+    expect(sockets.latest().sent.filter(command => command.kind === 'mode')).toEqual([
+      { v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'auto' },
+      { v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'dom' },
+    ])
+    expect(mode.getAttribute('data-mode')).toBe('dom')
+    actOn(() => { sockets.latest().pushLane({ tabId: 'tab-1', lane: 'capture' }) })
+    expect(mode.getAttribute('data-mode')).toBe('dom')
+    expect(mode.textContent).toBe(zh['panel.mode.dom'])
   })
 
   it('user switches to the mirror lane and the host is told', () => {
-    // Given a mounted body on the pixel lane, which is where a panel now starts
+    // Given a mounted body on the auto lane, which is where a panel starts
     const mounted = mountPanel()
     actOn(() => {
       sockets.latest().pushStatus('open')
@@ -608,7 +681,7 @@ describe('browser view lane switch and DOM mirror', () => {
     expect(mounted.container.querySelector('[data-dsh-part="mirror-notice"]')?.textContent)
       .toContain('the page forbids eval')
     expect(sockets.latest().sent.filter(command => command.kind === 'mode')).toEqual([
-      { v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'pixels' },
+      { v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'auto' },
       { v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'dom' },
     ])
   })
@@ -631,7 +704,7 @@ describe('browser view lane switch and DOM mirror', () => {
       .toEqual({ v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'pixels' })
   })
 
-  it('user switches back to the mirror after a fallback and the notice goes away', () => {
+  it('user goes back through auto after a fallback and the notice goes away', () => {
     // Given a body whose mirror the host has just reported unavailable, so it
     // fell back to the pixel lane with a notice
     const mounted = mountPanelOnMirrorLane()
@@ -641,14 +714,15 @@ describe('browser view lane switch and DOM mirror', () => {
     })
     expect(mounted.container.querySelector('[data-dsh-part="mirror-notice"]')).not.toBeNull()
 
-    // When the person asks for the mirror again
+    // When the person presses the switch, the next lane after pixels is auto:
+    // the one ask that lets the host re-resolve the page
     const mode = mounted.container.querySelector('[data-dsh-part="mode"]') as HTMLButtonElement
     actOn(() => { mode.click() })
 
-    // Then the lane is the mirror again, the notice is gone, and the host is asked
-    expect(mounted.container.querySelector('[data-dsh-part="mode"]')?.getAttribute('data-mode')).toBe('dom')
+    // Then the ask is auto again, the notice is gone, and the host is asked
+    expect(mounted.container.querySelector('[data-dsh-part="mode"]')?.getAttribute('data-mode')).toBe('auto')
     expect(mounted.container.querySelector('[data-dsh-part="mirror-notice"]')).toBeNull()
-    expect(sockets.latest().sent).toContainEqual({ v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'dom' })
+    expect(sockets.latest().sent).toContainEqual({ v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'auto' })
   })
 
   it('user closes the panel and the running replay is torn down', async () => {
@@ -674,13 +748,13 @@ describe('browser view lane switch and DOM mirror', () => {
 
     // When the toolbar is drawn
     // Then the switch is named in English rather than in the source language
-    expect(mounted.container.querySelector('[data-dsh-part="mode"]')?.textContent).toBe(en['panel.mode.pixels'])
+    expect(mounted.container.querySelector('[data-dsh-part="mode"]')?.textContent).toBe(en['panel.mode.auto'])
   })
 })
 
 describe('browser view lane switch and tab capture', () => {
   it('user presses the switch twice and the host is asked for the tab capture', () => {
-    // Given a mounted body on the pixel lane, which is where a panel starts
+    // Given a mounted body on the auto lane, which is where a panel starts
     const mounted = mountPanel()
     actOn(() => {
       sockets.latest().pushStatus('open')
@@ -694,7 +768,7 @@ describe('browser view lane switch and tab capture', () => {
 
     // Then the host receives both lanes in order and the switch names the capture
     expect(sockets.latest().sent.filter(command => command.kind === 'mode')).toEqual([
-      { v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'pixels' },
+      { v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'auto' },
       { v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'dom' },
       { v: BROWSER_VIEW_API_VERSION, kind: 'mode', mode: 'capture' },
     ])

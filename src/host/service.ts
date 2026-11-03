@@ -19,13 +19,19 @@
  *
  * Lanes. A panel declares which lane it renders (`mode`): the DOM mirror, whose
  * events come from src/core/mirror.ts, the tab capture, whose chunks come from
- * src/core/capture.ts, or the screencast. The declaration is per sink, so one
- * person can watch pixels while another watches DOM or a capture, and it is what
- * keeps a panel from before those lanes existed on exactly the frames it always
- * got. A lane runs only while some visible sink asks for it, and the screencast
- * runs while some visible sink still needs pixels — which includes a mirror that
- * has not delivered its first snapshot yet and a capture that has not delivered
- * its first chunk, so switching lanes never shows an empty stage.
+ * src/core/capture.ts, or the screencast. It can also ask for `auto` - the
+ * default - and then the host decides per page: one cheap `Runtime.evaluate`
+ * probe on the watched tab resolves media to the capture and anything else to
+ * the mirror, again on every navigation of the watched tab, and never on an
+ * interval. The declaration is per sink, so one person can watch pixels while
+ * another watches DOM or a capture, and it is what keeps a panel from before
+ * those lanes existed on exactly the lanes it can render. A lane runs only
+ * while some visible sink asks for it, and the screencast runs while some
+ * visible sink still needs pixels - which includes a mirror that has not
+ * delivered its first snapshot yet, a capture that has not delivered its first
+ * chunk, and an `auto` sink whose resolution has not landed, so switching
+ * lanes never shows an empty stage. A resolved lane that fails falls back to
+ * pixels with the reason - never sideways into the other lane a probe guessed.
  *
  * @module @jimorsm/dsh-client-ui-browser-view/host/service
  */
@@ -104,6 +110,23 @@ const CAPTURE_SINK_BUFFER_LIMIT = 4 * 1024 * 1024
 /** rrweb's FullSnapshot event type; a fresh replayer can start from one. */
 const RRWEB_FULL_SNAPSHOT = 2
 
+/**
+ * The one cheap probe that decides the `auto` lane: does the watched document
+ * carry media the DOM mirror cannot draw? A `<video>` counts by presence -
+ * even a hidden one is media the mirror renders as an empty box - while a
+ * canvas must have a real layout box, because every rrweb recording carries
+ * several zero-sized hidden canvases and none of them is a picture. It runs
+ * on the tab's own flat page session; on the browser-level socket the
+ * page-level domains answer `-32601`.
+ */
+const MEDIA_PROBE_EXPRESSION = `(() => {
+  if (document.querySelector('video')) return true
+  return Array.from(document.querySelectorAll('canvas')).some((canvas) => {
+    const box = canvas.getBoundingClientRect()
+    return box.width >= 64 && box.height >= 64
+  })
+})()`
+
 /** The checkpoint type of one rrweb event, when it carries one. */
 function eventTypeOf(event: unknown): number | undefined {
   if (typeof event !== 'object' || event === null) return undefined
@@ -141,6 +164,21 @@ export interface BrowserViewSink {
 interface SinkLane {
   /** Lane the panel asked for. Absent means {@link DEFAULT_VIEW_LANE}. */
   lane: BrowserViewLane
+  /**
+   * What the panel itself asked for, as distinct from what it is getting: for
+   * an `auto` panel {@link lane} holds the page's resolved lane while this
+   * stays `auto`, which is what keeps a resolution replaceable by the next one
+   * without erasing the panel's choice. Manual picks set both to the same lane.
+   */
+  requested: BrowserViewLane
+  /**
+   * Whether an `auto` resolution already failed once and the panel is resting
+   * on the pixel lane. A failed resolution must not re-arm on the next sync -
+   * the failure maps below already stop that - and it is cleared exactly by
+   * the two gestures that could plausibly have changed the page: asking for
+   * the lane again, and a navigation.
+   */
+  autoFallback: boolean
   /** Tab the cursor describes. */
   tabId: string | undefined
   /** Mirror generation the panel's replayer was built from, if any. */
@@ -153,6 +191,19 @@ interface SinkLane {
    * chunk with `reset` so the panel rebuilds its source buffer from a header.
    */
   captureGeneration: number | undefined
+}
+
+/** Build one empty lane record for a sink that has not chosen anything. */
+function freshSinkLane(): SinkLane {
+  return {
+    lane: DEFAULT_VIEW_LANE,
+    requested: DEFAULT_VIEW_LANE,
+    autoFallback: false,
+    tabId: undefined,
+    generation: undefined,
+    offset: 0,
+    captureGeneration: undefined,
+  }
 }
 
 /** What the route layer needs from the service; tests stub this instead. */
@@ -351,6 +402,13 @@ export class BrowserViewService implements BrowserViewBackend {
   private readonly mirrorFailures = new Map<string, string>()
   /** The tab the recorder is running for, if any; one mirror at a time. */
   private mirroredTabId: string | null = null
+  /**
+   * The media verdict per tab, from the `auto` probe. One verdict per page, not
+   * per probe call: every `auto` sink resolving against the same document shares
+   * one `Runtime.evaluate`, and the entry is dropped on navigation so the next
+   * page is probed, not assumed.
+   */
+  private readonly mediaProbes = new Map<string, boolean>()
   /** Batch counter for `dom` events; monotonic per service, not per tab. */
   private domSeq = 0
   /**
@@ -455,9 +513,10 @@ export class BrowserViewService implements BrowserViewBackend {
    */
   attach(sink: BrowserViewSink): () => void {
     this.sinks.add(sink)
-    // A panel that never asked for a lane renders pixels, which is what every
-    // panel built before the mirror existed does.
-    this.lanes.set(sink, { lane: DEFAULT_VIEW_LANE, tabId: undefined, generation: undefined, offset: 0, captureGeneration: undefined })
+    // A panel that never asked for a lane gets the host's default, which is
+    // `auto`: the page decides what it is worth showing, and this panel never
+    // had an opinion to override it with.
+    this.lanes.set(sink, freshSinkLane())
     // The hello frame is the panel's first paint: it carries the current tabs
     // so a reconnecting panel does not have to ask.
     sink.send({ v: 1, kind: 'hello', state: this.state() })
@@ -532,25 +591,30 @@ export class BrowserViewService implements BrowserViewBackend {
           // page is.
           const lane = this.laneOf(sink)
           lane.lane = command.mode
+          lane.requested = command.mode
+          lane.autoFallback = false
           lane.tabId = undefined
           lane.generation = undefined
           lane.offset = 0
           lane.captureGeneration = undefined
           const tabId = this.displayedOrDefault()
-          if (command.mode === 'dom') {
+          if (tabId !== null) {
             // Asking again is the one gesture that can change the outcome: a
             // page that failed to accept the recorder a moment ago may accept
-            // it now, and the person just pressed the switch.
-            if (tabId !== null) this.mirrorFailures.delete(tabId)
-            await this.syncLanes()
-          } else {
-            // Same gesture, same meaning for a capture that could not start.
-            if (command.mode === 'capture' && tabId !== null) this.captureFailures.delete(tabId)
-            await this.syncLanes()
-            // Neither the mirror nor a capture is a fallback for a picture: a
-            // panel that just switched has none, and waiting for the compositor
-            // to move could take as long as the page stays still.
-            if (tabId !== null) await this.session?.tabs.refreshFrame(tabId).catch(() => undefined)
+            // it now, and the person just pressed the switch. `auto` clears
+            // both, because which recorder it will need is exactly what the
+            // resolution below is about to decide.
+            if (command.mode === 'dom' || command.mode === 'auto') this.mirrorFailures.delete(tabId)
+            if (command.mode === 'capture' || command.mode === 'auto') this.captureFailures.delete(tabId)
+          }
+          await this.syncLanes()
+          // Neither the mirror nor a capture is a fallback for a picture: a
+          // panel that just switched has none, and waiting for the compositor
+          // to move could take as long as the page stays still. A panel that
+          // resolved to the mirror skips this - the mirror's first snapshot is
+          // the moment frames stop being its fallback anyway.
+          if (tabId !== null && this.laneOf(sink).lane !== 'dom') {
+            await this.session?.tabs.refreshFrame(tabId).catch(() => undefined)
           }
           return
         }
@@ -624,6 +688,8 @@ export class BrowserViewService implements BrowserViewBackend {
     // closed tab from holding a buffer nobody can ever read again.
     this.mirrorFailures.delete(tabId)
     this.captureFailures.delete(tabId)
+    // A closed tab's probe verdict has no reader left.
+    this.mediaProbes.delete(tabId)
     await this.stopMirror(tabId)
     // The capture dies with its target too, and its title goes back with it: a
     // closed tab must not leave the sentinel on whatever opens at that address.
@@ -1095,15 +1161,80 @@ export class BrowserViewService implements BrowserViewBackend {
   private needsPixels(sink: BrowserViewSink): boolean {
     const lane = this.lanes.get(sink)
     if (lane === undefined || lane.lane === 'pixels') return true
+    // An `auto` sink whose resolution has not landed yet is a sink with no
+    // picture at all: pixels keep the stage warm until the probe answers.
+    if (lane.lane === 'auto') return true
     if (lane.lane === 'dom') return lane.generation === undefined
     return lane.captureGeneration !== this.captureGeneration
+  }
+
+  /**
+   * Resolve every visible `auto` sink against the watched page.
+   *
+   * One probe per page, shared by every `auto` sink: they all watch the same
+   * tab, so asking the document once is once. The verdict is cached per tab and
+   * dropped on navigation, so a page is probed when a panel arrives or asks -
+   * never on an interval. A probe that fails reads as "no media": the mirror is
+   * the cheaper wrong answer, and its own failure path still lands in pixels.
+   */
+  private async resolveAutoLanes(): Promise<void> {
+    const tabId = this.displayedOrDefault()
+    if (tabId === null) return
+    const pending = this.activeSinks().filter((sink) => {
+      const lane = this.lanes.get(sink)
+      return lane !== undefined
+        && lane.requested === 'auto'
+        && lane.lane === 'auto'
+        && !lane.autoFallback
+    })
+    if (pending.length === 0) return
+    const hasMedia = await this.probeMedia(tabId)
+    for (const sink of pending) {
+      const lane = this.lanes.get(sink)
+      if (lane === undefined || lane.requested !== 'auto') continue
+      // The page decides, not the failure history: whichever lane this is, its
+      // own fallback path is what handles it not starting.
+      lane.lane = hasMedia ? 'capture' : 'dom'
+      this.sendTo(sink, { v: 1, kind: 'lane', tabId, lane: lane.lane })
+    }
+    // Push whatever the mirror already recorded: the page's recorder keeps
+    // writing while a resolution is in flight (a navigation re-arms the lane
+    // for exactly the moment a new document starts recording), and on a quiet
+    // page the next mirror event could be a long time coming.
+    this.broadcastDom(tabId)
+  }
+
+  /**
+   * Whether the watched document carries media the mirror cannot draw.
+   * @param tabId - the watched tab.
+   * @returns the page's verdict, cached until its next navigation.
+   */
+  private async probeMedia(tabId: string): Promise<boolean> {
+    const cached = this.mediaProbes.get(tabId)
+    if (cached !== undefined) return cached
+    let hasMedia = false
+    try {
+      const scope = this.scope()
+      const result = await scope.transport.send<{ result?: { value?: unknown } }>(
+        'Runtime.evaluate',
+        { expression: MEDIA_PROBE_EXPRESSION, returnByValue: true },
+        scope.tabs.sessionOf(tabId),
+      )
+      hasMedia = result.result?.value === true
+    } catch {
+      // A tab mid-navigation rejects evaluate; "no media yet" is the safe
+      // reading and the next resolution point re-asks.
+      hasMedia = false
+    }
+    this.mediaProbes.set(tabId, hasMedia)
+    return hasMedia
   }
 
   /** One panel's lane record, created on first use. */
   private laneOf(sink: BrowserViewSink): SinkLane {
     let lane = this.lanes.get(sink)
     if (lane === undefined) {
-      lane = { lane: DEFAULT_VIEW_LANE, tabId: undefined, generation: undefined, offset: 0, captureGeneration: undefined }
+      lane = freshSinkLane()
       this.lanes.set(sink, lane)
     }
     return lane
@@ -1129,6 +1260,11 @@ export class BrowserViewService implements BrowserViewBackend {
    * nobody renders must not keep a recorder running.
    */
   private async syncMirror(): Promise<void> {
+    // Resolution first: an `auto` sink is not on the mirror or the capture
+    // until the page has been asked what it is. Placed here and in syncCapture
+    // because those two run after every event that changes the answer; the
+    // pending check inside keeps a resolved set from being probed again.
+    await this.resolveAutoLanes()
     const session = this.session
     if (session === undefined) return
     const tabId = this.displayedOrDefault()
@@ -1163,6 +1299,10 @@ export class BrowserViewService implements BrowserViewBackend {
     if (!session.tabs.has(tabId)) return
     try {
       await mirror.start(tabId, session.tabs.sessionOf(tabId))
+      // Flush whatever the recorder emitted while the arm was in flight: those
+      // events triggered no delivery of their own, and a quiet page would not
+      // produce another one for a long time.
+      this.broadcastDom(tabId)
     } catch (error) {
       this.failMirror(tabId, error instanceof Error ? error.message : String(error))
     }
@@ -1207,6 +1347,10 @@ export class BrowserViewService implements BrowserViewBackend {
       // A panel rendering some other tab's mirror is not affected by this one.
       if (lane.tabId !== undefined && lane.tabId !== tabId) continue
       lane.lane = 'pixels'
+      // An `auto` sink rests on pixels until the next resolution point: falling
+      // from a failed mirror into the capture would trade one guess for
+      // another, and a page with no media never had a capture coming anyway.
+      if (lane.requested === 'auto') lane.autoFallback = true
       lane.tabId = undefined
       lane.generation = undefined
       lane.offset = 0
@@ -1214,6 +1358,46 @@ export class BrowserViewService implements BrowserViewBackend {
       this.sendTo(sink, { v: 1, kind: 'mirror', tabId, available: false, reason })
     }
     if (moved) void this.syncStreaming()
+  }
+
+  /**
+   * Re-resolve the `auto` sinks after the watched tab navigated.
+   *
+   * The probe verdict belongs to one document: a navigation is the one moment
+   * the answer can legitimately flip, so the cached verdict and the failure
+   * memories die with the old page and every `auto` sink goes back to
+   * unresolved. It stays that way only for the moment between this event and
+   * the next sync - pixels cover the gap, because an unresolved lane is a
+   * needs-pixels lane. Manual lanes are untouched: a person who picked a lane
+   * picked it for more than one page.
+   * @param sessionId - the session the navigation event arrived on.
+   * @param params - the `Page.frameNavigated` params.
+   */
+  private onWatchedNavigation(sessionId: string | undefined, params: Record<string, unknown>): void {
+    if (sessionId === undefined) return
+    const frame = (params as { frame?: { parentId?: unknown } }).frame
+    if (frame === undefined) return
+    // A sub-frame navigation does not replace the tab's document.
+    if (frame.parentId !== undefined) return
+    const tabId = this.session?.tabs.tabOfSession(sessionId)
+    if (tabId === undefined || tabId !== this.displayedOrDefault()) return
+    this.mediaProbes.delete(tabId)
+    // The old page's failures say nothing about the new one: a mirror the old
+    // document refused says nothing about the document that just landed.
+    this.mirrorFailures.delete(tabId)
+    this.captureFailures.delete(tabId)
+    let rearming = false
+    for (const lane of this.lanes.values()) {
+      if (lane.requested !== 'auto') continue
+      lane.autoFallback = false
+      lane.lane = 'auto'
+      lane.tabId = undefined
+      lane.generation = undefined
+      lane.offset = 0
+      lane.captureGeneration = undefined
+      rearming = true
+    }
+    if (rearming) void this.syncLanes()
   }
 
   /**
@@ -1229,6 +1413,7 @@ export class BrowserViewService implements BrowserViewBackend {
    * chunk of latency for a gesture (a switch, an attach) that happens rarely.
    */
   private async syncCapture(): Promise<void> {
+    await this.resolveAutoLanes()
     const session = this.session
     if (session === undefined) return
     const tabId = this.displayedOrDefault()
@@ -1362,6 +1547,9 @@ export class BrowserViewService implements BrowserViewBackend {
       // A panel rendering some other tab's capture is not affected by this one.
       if (lane.tabId !== undefined && lane.tabId !== tabId) continue
       lane.lane = 'pixels'
+      // Same rule as the mirror's fallback: an `auto` sink whose resolved
+      // capture failed goes to pixels, never sideways into the mirror.
+      if (lane.requested === 'auto') lane.autoFallback = true
       lane.tabId = undefined
       lane.generation = undefined
       lane.offset = 0
@@ -1553,6 +1741,7 @@ export class BrowserViewService implements BrowserViewBackend {
     this.relays.clear()
     this.lanes.clear()
     this.mirrorFailures.clear()
+    this.mediaProbes.clear()
     this.mirroredTabId = null
     this.captureFailures.clear()
     this.capturedTabId = null
@@ -1618,6 +1807,7 @@ export class BrowserViewService implements BrowserViewBackend {
     this.lastError = reason
     this.lanes.clear()
     this.mirrorFailures.clear()
+    this.mediaProbes.clear()
     this.mirroredTabId = null
     this.captureFailures.clear()
     this.capturedTabId = null
@@ -1683,6 +1873,16 @@ export class BrowserViewService implements BrowserViewBackend {
       // its connection ends, so the next call starts a fresh browser instead of
       // failing forever against a corpse.
       session.transport.onClose(() => { this.loseSession('the browser connection dropped') })
+      // A navigation of the watched tab is the one moment the `auto` verdict
+      // can flip; the plumbing is the same flat-session event stream the
+      // capture's own loss detection rides.
+      session.transport.on('Page.frameNavigated', (params, sessionId) => {
+        try {
+          this.onWatchedNavigation(sessionId, params)
+        } catch {
+          // A listener must never break the transport's event delivery.
+        }
+      })
       this.lastError = undefined
       this.broadcast({ v: 1, kind: 'state', state: this.state() })
       return session

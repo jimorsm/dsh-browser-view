@@ -91,6 +91,21 @@ export interface BrowserViewCaptureStatus {
   readonly reason?: string
 }
 
+/**
+ * Which concrete lane the host resolved an `auto` panel to.
+ *
+ * Only panels that asked for `auto` need to read it - the resolution is their
+ * view of the page, and the switch has to name it. A host older than this
+ * event simply never sends it, and such a panel shows the unresolved `auto`
+ * label until it picks a lane itself.
+ */
+export interface BrowserViewLaneResolution {
+  /** Tab the resolution belongs to. */
+  readonly tabId: string
+  /** The rendered lane; `auto` never resolves to itself. */
+  readonly lane: 'dom' | 'capture' | 'pixels'
+}
+
 /** One decoded batch of tab-capture bytes, exactly as the panel needs it. */
 export interface BrowserViewCaptureChunk {
   /** Tab the recording belongs to. */
@@ -121,6 +136,8 @@ export interface BrowserViewSocketHandlers {
   onCaptureChunk?(chunk: BrowserViewCaptureChunk): void
   /** The host reported whether the tab capture runs for a tab. */
   onCapture?(status: BrowserViewCaptureStatus): void
+  /** The host resolved our `auto` lane to a concrete lane for a tab. */
+  onLane?(resolution: BrowserViewLaneResolution): void
   /** The agent performed one tool action. */
   onAction(trace: BrowserActionTrace): void
   /** The host reported a failure the panel must show instead of a frame. */
@@ -343,6 +360,12 @@ export function parseBrowserViewEvent(value: unknown): BrowserViewEvent | null {
         ...(typeof candidate.reason === 'string' ? { reason: candidate.reason } : {}),
       }
     }
+    case 'lane': {
+      if (typeof candidate.tabId !== 'string') return null
+      const resolved = candidate.lane
+      if (resolved !== 'dom' && resolved !== 'capture' && resolved !== 'pixels') return null
+      return { v: BROWSER_VIEW_API_VERSION, kind: 'lane', tabId: candidate.tabId, lane: resolved }
+    }
     case 'capture-chunk': {
       if (typeof candidate.tabId !== 'string') return null
       if (typeof candidate.seq !== 'number') return null
@@ -489,6 +512,9 @@ export function connectBrowserViewSocket(
           available: event.available,
           ...(event.reason === undefined ? {} : { reason: event.reason }),
         })
+        return
+      case 'lane':
+        handlers.onLane?.({ tabId: event.tabId, lane: event.lane })
         return
       case 'capture-chunk': {
         // A chunk is part of a stream, so a duplicate or an overtaken one is

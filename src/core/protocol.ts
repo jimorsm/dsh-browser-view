@@ -33,6 +33,12 @@
  * `capture-chunk` payload, which obey exactly that rule: an older panel never
  * sends `mode: 'capture'`, an older host answers it with one `invalid-command`
  * error, and a payload kind this version does not know is dropped unread.
+ *
+ * Kept at 1 a final time for the `auto` lane and the `lane` event, which obey
+ * it too: an older panel never sends `mode: 'auto'`, an older host answers it
+ * with one `invalid-command` error, and a `lane` push is a kind the old panel
+ * drops unread - which is safe, because an `auto` panel is the only receiver
+ * that has to understand it.
  */
 export const BROWSER_VIEW_API_VERSION = 1
 
@@ -115,8 +121,15 @@ export interface BrowserPanelState {
  * `SecurityError` on a same-page cross-origin `file://` media element). Tab
  * capture goes through the browser's own capture surface instead of the
  * element, so it is origin-independent.
+ *
+ * `auto` is the lane a panel picks to let the host decide per page: the host
+ * probes the watched document once per navigation and resolves it to `capture`
+ * when the page has media (a `<video>`, or a canvas big enough to be a
+ * picture) and to `dom` otherwise. It is a *requested* lane, not a rendered
+ * one - what the host actually runs is always one of the three above, and it
+ * tells the panel which through the `lane` event.
  */
-export type BrowserViewLane = 'capture' | 'dom' | 'pixels'
+export type BrowserViewLane = 'auto' | 'capture' | 'dom' | 'pixels'
 
 /**
  * Container/codec the tab capture is recorded and replayed in.
@@ -131,11 +144,13 @@ export const CAPTURE_MIME = 'video/webm;codecs=vp8'
 /**
  * Lane a panel renders before it has said anything.
  *
- * Deliberately the pixel lane on the host side: a panel built before this
- * feature existed never sends `mode`, and it must keep receiving exactly what
- * it received before - frames, no mirror traffic, no recorder running.
+ * Deliberately `auto`: suitability is a property of the page, not of the
+ * panel, and a panel that never says anything is exactly the panel that cannot
+ * know what the page it is watching needs. A panel built before a lane existed
+ * keeps working - it simply gets the lane the page deserves instead of the one
+ * lane that predates it, and the pixel stage still covers every arming gap.
  */
-export const DEFAULT_VIEW_LANE: BrowserViewLane = 'pixels'
+export const DEFAULT_VIEW_LANE: BrowserViewLane = 'auto'
 
 /** One line of the panel's "what is the agent doing" trace. */
 export interface BrowserActionTrace {
@@ -233,6 +248,19 @@ export type BrowserViewEvent =
       mime: string
       /** Base64 WebM bytes of one recorder chunk, no data: prefix. */
       data: string
+    }
+  | {
+      v: 1
+      kind: 'lane'
+      /** Tab the resolution belongs to. */
+      tabId: string
+      /**
+       * The concrete lane an `auto` panel is watching. Only the three rendered
+       * lanes can appear here - `auto` never resolves to itself - and only a
+       * panel that asked for `auto` has to understand this event; every other
+       * kind of panel ignores it.
+       */
+      lane: 'dom' | 'capture' | 'pixels'
     }
   | { v: 1; kind: 'rtc-answer'; sdp: string }
   | { v: 1; kind: 'error'; code: string; message: string }
@@ -396,7 +424,7 @@ export function isBrowserViewCommand(value: unknown): value is BrowserViewComman
     case 'input':
       return isBrowserInputEvent(candidate.input)
     case 'mode':
-      return candidate.mode === 'dom' || candidate.mode === 'pixels' || candidate.mode === 'capture'
+      return candidate.mode === 'auto' || candidate.mode === 'dom' || candidate.mode === 'pixels' || candidate.mode === 'capture'
     case 'rtc-offer':
       return typeof candidate.sdp === 'string' && candidate.sdp.length > 0
     case 'stream':

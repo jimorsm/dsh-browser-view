@@ -20,7 +20,7 @@ export declare const BROWSER_VIEW_PARTS: {
     readonly toolbar: "toolbar";
     /** The read-only address display of the streamed page. */
     readonly address: "address";
-    /** The lane switch: pixel stream, DOM mirror or tab capture. */
+    /** The lane switch: auto (resolved per page), pixel stream, DOM mirror or tab capture. */
     readonly mode: "mode";
     /** The controlled browser's tab chips; drawn only when it holds several. */
     readonly tabs: "tabs";

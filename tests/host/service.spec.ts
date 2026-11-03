@@ -620,8 +620,9 @@ describe('dom mirror lane', () => {
     expect(tab.id).toBe('tab-1')
   })
 
-  it('a panel that never asks for a lane records nothing', async () => {
-    // Given one open tab and an attached panel that says nothing about lanes
+  it('a panel that never asks for a lane gets the page resolved on its behalf', async () => {
+    // Given one open tab without media and an attached panel that says
+    // nothing about lanes
     const browser = createFakeBrowser()
     const alice = recordingSink()
     await browser.service.ensureTab('session-a')
@@ -629,10 +630,13 @@ describe('dom mirror lane', () => {
     await new Promise(resolve => setTimeout(resolve, 0))
 
     // When the panel models the default behaviour
-    // Then no recorder was ever injected, so a panel from before the mirror
-    // existed costs the page nothing
-    expect(browser.transport.callsOf('Runtime.addBinding')).toHaveLength(0)
-    expect(browser.transport.callsOf('Page.addScriptToEvaluateOnNewDocument')).toHaveLength(0)
+    // Then the host probed the page once, resolved it to the mirror, said so,
+    // and injected the recorder - the default is now the page's own lane
+    const probes = browser.transport.callsOf('Runtime.evaluate')
+      .filter(call => String(call.params.expression ?? '').includes("querySelector('video')"))
+    expect(probes).toHaveLength(1)
+    expect(browser.transport.callsOf('Page.addScriptToEvaluateOnNewDocument')).toHaveLength(1)
+    expect(alice.events).toContainEqual({ v: 1, kind: 'lane', tabId: 'tab-1', lane: 'dom' })
   })
 
   it('a mirroring panel receives the recording and stops paying for frames', async () => {
@@ -673,17 +677,29 @@ describe('dom mirror lane', () => {
     await browser.service.handleCommand(alice.sink, { v: 1, kind: 'mode', mode: 'dom' })
     recordSnapshot(browser.transport, 'session-1')
 
-    // When a second panel asks for the same mirror
+    // When a second panel attaches, the host resolves its default auto lane to
+    // the mirror already running for this tab
     browser.service.attach(bob.sink)
-    bob.events.length = 0
-    await browser.service.handleCommand(bob.sink, { v: 1, kind: 'mode', mode: 'dom' })
-    emitDom(browser.transport, recorded(3, 9), 'session-1')
+    await new Promise(resolve => setTimeout(resolve, 0))
 
     // Then that panel does not have to have been there from the start: the
-    // first batch it receives is the whole recording and says so
+    // first batch it receives is the whole recording from the checkpoint and
+    // says so - delivered at resolution time, not only on the next mutation
     const first = bob.events.find(event => event.kind === 'dom')
     expect(first).toMatchObject({ reset: true, tabId: 'tab-1' })
-    expect((first as { events: unknown[] }).events.length).toBeGreaterThanOrEqual(3)
+    const batch = first as { events: Array<{ type: number }> }
+    expect(batch.events.some(event => event.type === 2)).toBe(true)
+
+    // And a mutation recorded afterwards arrives as a live increment on top
+    bob.events.length = 0
+    emitDom(browser.transport, recorded(3, 9), 'session-1')
+    expect(bob.events.filter(event => event.kind === 'dom')).toEqual([{
+      v: 1,
+      kind: 'dom',
+      tabId: 'tab-1',
+      seq: expect.any(Number),
+      events: [recorded(3, 9)],
+    }])
   })
 
   it('a hidden panel receives no mirror traffic while another keeps it', async () => {
@@ -1214,5 +1230,128 @@ describe('tab capture lane', () => {
 
     // Then no capture was armed for the tab nobody is rendering
     expect(startCalls(browser.transport)).toHaveLength(0)
+  })
+})
+
+describe('auto lane', () => {
+  /** The lane resolutions a sink received, in order. */
+  function lanesOf(events: BrowserViewEvent[]): Array<Extract<BrowserViewEvent, { kind: 'lane' }>> {
+    return events.filter((event): event is Extract<BrowserViewEvent, { kind: 'lane' }> => event.kind === 'lane')
+  }
+
+  /** The capture lane's page-side bootstrap calls. */
+  function captureStarts(transport: ReturnType<typeof createFakeBrowser>['transport']): number {
+    return transport.callsOf('Runtime.evaluate')
+      .filter(call => String(call.params.expression ?? '').includes('SENTINEL')).length
+  }
+
+  it('a page with media resolves auto to the capture', async () => {
+    // Given an open tab whose probe reports media, and an attached panel on
+    // the default lane
+    const browser = createFakeBrowser({ mediaProbe: () => true })
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // When the resolution lands
+    // Then the panel is told the capture, and the capture really armed: the
+    // binding and the sentinel rename both reached the page
+    expect(lanesOf(alice.events)).toEqual([{ v: 1, kind: 'lane', tabId: 'tab-1', lane: 'capture' }])
+    expect(browser.transport.callsOf('Runtime.addBinding').length).toBeGreaterThan(0)
+    expect(captureStarts(browser.transport)).toBeGreaterThan(0)
+    expect(browser.transport.callsOf('Page.addScriptToEvaluateOnNewDocument')).toHaveLength(0)
+  })
+
+  it('a navigation re-resolves auto against the new page', async () => {
+    // Given a panel whose auto lane resolved a page without media to the mirror
+    let hasMedia = false
+    const browser = createFakeBrowser({ mediaProbe: () => hasMedia })
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(lanesOf(alice.events)).toEqual([{ v: 1, kind: 'lane', tabId: 'tab-1', lane: 'dom' }])
+
+    // When the tab navigates to a page that carries media
+    hasMedia = true
+    browser.transport.emit('Page.frameNavigated', { frame: { url: 'https://b.test/video' } }, 'session-1')
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Then the resolution flipped to the capture for the new document - the
+    // verdict belongs to one page, not to the panel
+    expect(lanesOf(alice.events)).toEqual([
+      { v: 1, kind: 'lane', tabId: 'tab-1', lane: 'dom' },
+      { v: 1, kind: 'lane', tabId: 'tab-1', lane: 'capture' },
+    ])
+    expect(captureStarts(browser.transport)).toBeGreaterThan(0)
+  })
+
+  it('a navigation of a tab nobody watches does not re-resolve', async () => {
+    // Given a panel pinned to the first of two tabs, resolved to the mirror
+    let hasMedia = false
+    const browser = createFakeBrowser({ mediaProbe: () => hasMedia })
+    const alice = recordingSink()
+    const first = await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'select-tab', tabId: first.id })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await browser.service.ensureTab('session-b')
+    alice.events.length = 0
+
+    // When the unwatched tab navigates to a page with media
+    hasMedia = true
+    browser.transport.emit('Page.frameNavigated', { frame: { url: 'https://b.test/video' } }, 'session-2')
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Then the watched panel's resolution is untouched
+    expect(lanesOf(alice.events)).toEqual([])
+    expect(captureStarts(browser.transport)).toBe(0)
+  })
+
+  it('a failed mirror resolution falls back to pixels, never sideways into the capture', async () => {
+    // Given a page without media whose mirror injection always fails
+    const browser = createFakeBrowser()
+    browser.transport.responses.set('Page.addScriptToEvaluateOnNewDocument', () => {
+      throw new Error('the page forbids injection')
+    })
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // When the resolution to the mirror fails
+    // Then the panel is told the mirror is gone with the reason, and no
+    // capture ever armed - a video-less page has no capture coming, and a
+    // failed guess must not become a second guess
+    expect(alice.events).toContainEqual({
+      v: 1,
+      kind: 'mirror',
+      tabId: 'tab-1',
+      available: false,
+      reason: 'the page forbids injection',
+    })
+    expect(browser.transport.callsOf('Runtime.addBinding')).toHaveLength(0)
+    expect(captureStarts(browser.transport)).toBe(0)
+  })
+
+  it('auto respects the pause machinery: a hidden panel keeps its resolution quiet', async () => {
+    // Given a media page and an attached panel that hid itself
+    const browser = createFakeBrowser({ mediaProbe: () => true })
+    const alice = recordingSink()
+    await browser.service.ensureTab('session-a')
+    browser.service.attach(alice.sink)
+    await browser.service.handleCommand(alice.sink, { v: 1, kind: 'stream', enabled: false })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    browser.transport.calls.length = 0
+
+    // When the hidden panel is the only one left and a navigation re-arms it
+    browser.transport.emit('Page.frameNavigated', { frame: { url: 'https://b.test/video' } }, 'session-1')
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Then the hidden panel made no page-side lane traffic: resolution waits
+    // for a viewer, exactly like the recorders do
+    expect(browser.transport.callsOf('Runtime.evaluate')).toEqual([])
+    expect(browser.transport.callsOf('Runtime.addBinding')).toEqual([])
   })
 })

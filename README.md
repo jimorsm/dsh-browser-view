@@ -45,17 +45,18 @@ Bandwidth is designed for "look when you need to, step in when you must", not fo
 | Frame budget | At most about 15 fps while nobody interacts, opened to about 30 fps for three seconds after any input |
 | Invisible means stopped | A collapsed sidebar, another chip in front, or a hidden browser tab tells the host; the **last** watching panel leaving stops the screencast outright - nothing is captured, encoded or sent - and returning restores it with one fresh frame |
 
-## Three lanes: pixels, the DOM mirror and the tab capture
+## Four lanes: auto, pixels, the DOM mirror and the tab capture
 
-The panel can render the page **three ways**, and you choose which:
+The panel can render the page **four ways**. `auto` is the default, and you can pick any of the others:
 
 | Lane | How it works | What it is for |
 | --- | --- | --- |
-| Pixel stream (default) | CDP `Page.startScreencast` frames, exactly as before | Anything at all - `<video>`, canvas, native UI, DRM - and the automatic fallback of the other two lanes |
+| Auto (default) | The host probes the watched tab with one cheap `Runtime.evaluate` - does the document carry media the mirror cannot draw? - and resolves media to the capture and everything else to the mirror. It re-resolves on every navigation of the watched tab and never polls | Letting the page decide: crisp text on quiet pages, a real picture on media pages, no opinion required |
+| Pixel stream | CDP `Page.startScreencast` frames, exactly as before | Anything at all - `<video>`, canvas, native UI, DRM - and the automatic fallback of the other lanes |
 | DOM mirror | The host injects rrweb's recorder into the tab (`Page.addScriptToEvaluateOnNewDocument` for future documents, `Runtime.evaluate` for the loaded one), records each mutation and streams it to the panel, which replays it with rrweb's own replayer in live mode | Text and UI pages: crisp at any panel width, and traffic proportional to what changed rather than to how often the page repaints |
 | Tab capture | Chromium is launched with `--auto-select-tab-capture-source-by-title=<sentinel>`, `--use-fake-ui-for-media-stream` and `--enable-usermedia-screen-capturing`; right before capturing, the host renames the watched tab to the sentinel (the flag matches the title *at capture time*) and asks the page for `getDisplayMedia({ video: { displaySurface: 'browser' }, audio: false, preferCurrentTab: true })`; the page forwards `MediaRecorder` chunks (`video/webm;codecs=vp8`, ~1.5 Mbps, 200 ms slices) over a `Runtime.addBinding` binding and the panel plays them with MSE | A real *picture* of cross-origin media. A DOM mirror has an element where a `<video>` is and no pixels in it, and element-level `captureStream()` throws `SecurityError` for a cross-origin CDN - which is where a page's media almost always lives. Tab capture goes through the browser's own surface, so the origin of the media never enters into it |
 
-The switch sits in the toolbar and names the lane currently on screen; pressing it cycles pixels → mirror → capture. The mirror and the capture are both **read-only**: a click on a replayed node or on the captured video is not mapped back to a CDP action, because neither is the page's own element tree. Input stays on the pixel lane.
+The switch sits in the toolbar and names the lane currently on screen - for `auto`, the lane the page resolved to (for example "Auto (mirror)"), so a viewer always knows whether they are watching a recording; pressing it cycles auto → mirror → capture → pixels. The mirror and the capture are both **read-only**: a click on a replayed node or on the captured video is not mapped back to a CDP action, because neither is the page's own element tree. Input stays on the pixel lane.
 
 Two things are deliberate about the two non-pixel lanes' cost:
 
