@@ -42,6 +42,18 @@ import type { CdpTransport } from './cdp.ts'
  * reports. Named after the plugin rather than something short: it lands on the
  * watched page's `window`, which may be a page the agent does not own.
  */
+/**
+ * When the mirror arms, one more checkpoint is taken this many milliseconds
+ * later. The first snapshot races the page: armed at navigation, it serialises
+ * whatever the SPA has built so far, and a slow page (bilibili) is still an
+ * empty shell - broken image placeholders the panel then keeps until the lane
+ * is re-armed. A second snapshot a moment later serialises the finished page;
+ * rrweb's anchor logic keeps it as the newest checkpoint and the panel rebuilds
+ * from it. Guarded, so a page that never finishes loading simply keeps its
+ * early snapshot.
+ */
+export const CHECKPOINT_REARM_DELAY_MS = 3000
+
 export const MIRROR_BINDING_NAME = 'dshBrowserViewDomMirror'
 
 /** Private global holding the bundled rrweb build, and the live recording. */
@@ -239,6 +251,12 @@ export interface DomMirrorOptions {
   source: () => string
   /** Binding the recorder emits into. @default MIRROR_BINDING_NAME */
   bindingName?: string
+  /**
+   * How long after arming the delayed second checkpoint waits. Tests set it
+   * small; the production default is CHECKPOINT_REARM_DELAY_MS.
+   * @default CHECKPOINT_REARM_DELAY_MS
+   */
+  checkpointDelayMs?: number
   /** Receives one tab id whenever that tab's recording changed. */
   onEvent?: (tabId: string) => void
   /** Receives a mirror that could not start, or died, with the reason. */
@@ -273,6 +291,9 @@ export class DomMirror {
   private readonly sessions = new Map<string, MirrorSession>()
   /** Session whose binding payloads currently belong to which tab. */
   private readonly tabBySession = new Map<string, string>()
+  /** Pending delayed checkpoints, one per mirrored tab. */
+  private readonly checkpointTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private readonly checkpointDelayMs: number
   /** In-flight starts, so two panels asking at once attach once. */
   private readonly starting = new Map<string, Promise<void>>()
   private readonly unsubscribers: Array<() => void> = []
@@ -285,6 +306,7 @@ export class DomMirror {
     this.transport = options.transport
     this.source = options.source
     this.bindingName = options.bindingName ?? MIRROR_BINDING_NAME
+    this.checkpointDelayMs = options.checkpointDelayMs ?? CHECKPOINT_REARM_DELAY_MS
     this.onEvent = options.onEvent
     this.onFailure = options.onFailure
     this.subscribe()
@@ -345,6 +367,7 @@ export class DomMirror {
   async stop(tabId: string): Promise<void> {
     const session = this.sessions.get(tabId)
     if (session === undefined) return
+    this.forgetCheckpointTimer(tabId)
     this.sessions.delete(tabId)
     this.tabBySession.delete(session.sessionId)
     // The new-document registration goes first: it is the promise that a future
@@ -370,8 +393,51 @@ export class DomMirror {
     for (const unsubscribe of this.unsubscribers.splice(0)) unsubscribe()
     const tabIds = [...this.sessions.keys()]
     for (const tabId of tabIds) await this.stop(tabId).catch(() => undefined)
+    for (const timer of this.checkpointTimers.values()) clearTimeout(timer)
+    this.checkpointTimers.clear()
     this.sessions.clear()
     this.tabBySession.clear()
+  }
+
+  /**
+   * Forget the pending delayed checkpoint of one tab. Every path that drops a
+   * recording goes through here, because a timer for a session nobody holds
+   * would either fire into nothing or, worse, re-snapshot a tab whose recorder
+   * was replaced.
+   * @param tabId - target tab.
+   */
+  private forgetCheckpointTimer(tabId: string): void {
+    const timer = this.checkpointTimers.get(tabId)
+    if (timer === undefined) return
+    this.checkpointTimers.delete(tabId)
+    clearTimeout(timer)
+  }
+
+  /**
+   * Schedule one more checkpoint a moment after arming. The guard re-reads the
+   * session at fire time: only the recording this timer was armed for may
+   * re-snapshot, so a stop or a replacement in between is honoured, not raced.
+   * @param tabId - the tab the recording belongs to.
+   * @param session - that recording; identity is the guard.
+   */
+  private scheduleCheckpoint(tabId: string, session: MirrorSession): void {
+    this.forgetCheckpointTimer(tabId)
+    const timer = setTimeout(() => {
+      this.checkpointTimers.delete(tabId)
+      // A session replaced or dropped while the timer waited must not
+      // re-snapshot; the guard is identity, not just presence.
+      if (this.sessions.get(tabId) !== session) return
+      void this.transport.send('Runtime.evaluate', {
+        expression: 'try { typeof window.__dshBrowserViewRrweb'
+          + '?.takeFullSnapshot === "function"'
+          + ' && window.__dshBrowserViewRrweb.takeFullSnapshot(false) } catch (ignored) {} true',
+        returnByValue: true,
+      }, session.sessionId).catch(() => undefined)
+    }, this.checkpointDelayMs)
+    // A timer must not hold the host process open on its own; the mirror is
+    // torn down explicitly.
+    timer.unref?.()
+    this.checkpointTimers.set(tabId, timer)
   }
 
   /** Inject the recorder and start it in the document that is loaded. */
@@ -414,6 +480,7 @@ export class DomMirror {
     }, sessionId)
     const failure = describeInjection(result)
     if (failure !== undefined) {
+      this.forgetCheckpointTimer(tabId)
       this.sessions.delete(tabId)
       this.tabBySession.delete(sessionId)
       if (typeof registered.identifier === 'string') {
@@ -438,6 +505,10 @@ export class DomMirror {
         + ' && window.__dshBrowserViewRrweb.takeFullSnapshot(false) } catch (ignored) {} true',
       returnByValue: true,
     }, sessionId).catch(() => undefined)
+    // The immediate snapshot still races a slow SPA: it serialises the shell
+    // that exists now, not the finished page. One delayed snapshot catches the
+    // page as the person sees it.
+    this.scheduleCheckpoint(tabId, session)
   }
 
   /** Route one binding payload into the tab that owns its session. */
@@ -463,6 +534,7 @@ export class DomMirror {
       // A recorder that threw is torn down here rather than left alone: its
       // new-document registration would re-arm the same failure on every
       // navigation, and the panel is about to be told why it fell back.
+      this.forgetCheckpointTimer(tabId)
       this.sessions.delete(tabId)
       this.tabBySession.delete(sessionId)
       if (session.scriptId !== undefined) {
