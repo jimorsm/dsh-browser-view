@@ -9,7 +9,7 @@
  * with the panel (which events a recording keeps, and when a replayer holding
  * it has to be rebuilt).
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { FakeTransport } from '../helpers/fake-cdp.ts'
 import {
   DomMirror,
@@ -35,7 +35,7 @@ function incremental(timestamp: number): Record<string, unknown> {
 }
 
 /** A mirror over one scripted transport, with everything it reported. */
-function mirrorHarness(): {
+function mirrorHarness(options: { readonly checkpointDelayMs?: number } = {}): {
   transport: FakeTransport
   mirror: DomMirror
   events: string[]
@@ -53,8 +53,17 @@ function mirrorHarness(): {
     source: () => '/* RECORDER */',
     onEvent: tabId => { events.push(tabId) },
     onFailure: (tabId, reason) => { failures.push({ tabId, reason }) },
+    ...(options.checkpointDelayMs === undefined ? {} : { checkpointDelayMs: options.checkpointDelayMs }),
   })
   return { transport, mirror, events, failures }
+}
+
+/** How many delayed checkpoints the transport has been asked for. */
+function checkpointCalls(transport: FakeTransport): number {
+  return transport.calls.filter(call =>
+    call.method === 'Runtime.evaluate'
+    && String((call.params as { expression?: string }).expression ?? '').includes('takeFullSnapshot'),
+  ).length
 }
 
 /** Deliver one recorder payload as the browser would. */
@@ -312,5 +321,66 @@ describe('collecting a recording', () => {
     expect(failures).toEqual([{ tabId: 'tab-1', reason: 'the recorder stopped inside the page: the page hung' }])
     expect(mirror.isRecording('tab-1')).toBe(false)
     expect(transport.callsOf('Page.removeScriptToEvaluateOnNewDocument')).toHaveLength(1)
+  })
+})
+
+describe('delayed checkpoint after arming', () => {
+  it('host arms a recording and takes one more checkpoint a moment later', async () => {
+    // Given a mirror whose delayed checkpoint waits a short, test-sized delay
+    vi.useFakeTimers()
+    try {
+      const { transport, mirror } = mirrorHarness({ checkpointDelayMs: 100 })
+      await mirror.start('tab-1', 'session-1')
+      expect(checkpointCalls(transport)).toBe(1)
+
+      // When the delay elapses
+      await vi.advanceTimersByTimeAsync(100)
+
+      // Then the finished page was re-snapshotted: the early snapshot raced the
+      // SPA and a slow page needs the second look
+      expect(checkpointCalls(transport)).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('operator stops the mirror and the pending checkpoint never fires', async () => {
+    // Given a recording with a checkpoint still pending
+    vi.useFakeTimers()
+    try {
+      const { transport, mirror } = mirrorHarness({ checkpointDelayMs: 100 })
+      await mirror.start('tab-1', 'session-1')
+
+      // When the recording is stopped before the delay elapses
+      await mirror.stop('tab-1')
+      await vi.advanceTimersByTimeAsync(500)
+
+      // Then nothing re-snapshots a tab nobody watches
+      expect(checkpointCalls(transport)).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a replaced recording is not re-snapshotted by the timer of the recording it replaced', async () => {
+    // Given a recording whose delayed checkpoint is pending
+    vi.useFakeTimers()
+    try {
+      const { transport, mirror } = mirrorHarness({ checkpointDelayMs: 100 })
+      await mirror.start('tab-1', 'session-1')
+      // A stop and a fresh arm replaces the session; the predecessor's timer
+      // must not fire into a session nobody holds
+      await mirror.stop('tab-1')
+      await mirror.start('tab-1', 'session-2')
+      const before = checkpointCalls(transport)
+
+      // When the predecessor's delay would have elapsed
+      await vi.advanceTimersByTimeAsync(100)
+
+      // Then exactly the replacement's checkpoint fired - one, not two
+      expect(checkpointCalls(transport)).toBe(before + 1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

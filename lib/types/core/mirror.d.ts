@@ -40,6 +40,17 @@ import type { CdpTransport } from './cdp.ts';
  * reports. Named after the plugin rather than something short: it lands on the
  * watched page's `window`, which may be a page the agent does not own.
  */
+/**
+ * When the mirror arms, one more checkpoint is taken this many milliseconds
+ * later. The first snapshot races the page: armed at navigation, it serialises
+ * whatever the SPA has built so far, and a slow page (bilibili) is still an
+ * empty shell - broken image placeholders the panel then keeps until the lane
+ * is re-armed. A second snapshot a moment later serialises the finished page;
+ * rrweb's anchor logic keeps it as the newest checkpoint and the panel rebuilds
+ * from it. Guarded, so a page that never finishes loading simply keeps its
+ * early snapshot.
+ */
+export declare const CHECKPOINT_REARM_DELAY_MS = 3000;
 export declare const MIRROR_BINDING_NAME = "dshBrowserViewDomMirror";
 /**
  * Events kept per tab between checkpoints, and the byte ceiling beside it.
@@ -142,6 +153,12 @@ export interface DomMirrorOptions {
     source: () => string;
     /** Binding the recorder emits into. @default MIRROR_BINDING_NAME */
     bindingName?: string;
+    /**
+     * How long after arming the delayed second checkpoint waits. Tests set it
+     * small; the production default is CHECKPOINT_REARM_DELAY_MS.
+     * @default CHECKPOINT_REARM_DELAY_MS
+     */
+    checkpointDelayMs?: number;
     /** Receives one tab id whenever that tab's recording changed. */
     onEvent?: (tabId: string) => void;
     /** Receives a mirror that could not start, or died, with the reason. */
@@ -159,6 +176,9 @@ export declare class DomMirror {
     private readonly sessions;
     /** Session whose binding payloads currently belong to which tab. */
     private readonly tabBySession;
+    /** Pending delayed checkpoints, one per mirrored tab. */
+    private readonly checkpointTimers;
+    private readonly checkpointDelayMs;
     /** In-flight starts, so two panels asking at once attach once. */
     private readonly starting;
     private readonly unsubscribers;
@@ -196,6 +216,22 @@ export declare class DomMirror {
     stop(tabId: string): Promise<void>;
     /** Stop every recording and detach the protocol listener. */
     dispose(): Promise<void>;
+    /**
+     * Forget the pending delayed checkpoint of one tab. Every path that drops a
+     * recording goes through here, because a timer for a session nobody holds
+     * would either fire into nothing or, worse, re-snapshot a tab whose recorder
+     * was replaced.
+     * @param tabId - target tab.
+     */
+    private forgetCheckpointTimer;
+    /**
+     * Schedule one more checkpoint a moment after arming. The guard re-reads the
+     * session at fire time: only the recording this timer was armed for may
+     * re-snapshot, so a stop or a replacement in between is honoured, not raced.
+     * @param tabId - the tab the recording belongs to.
+     * @param session - that recording; identity is the guard.
+     */
+    private scheduleCheckpoint;
     /** Inject the recorder and start it in the document that is loaded. */
     private arm;
     /** Route one binding payload into the tab that owns its session. */
