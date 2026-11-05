@@ -17,6 +17,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const rrwebMock = vi.hoisted(() => ({
   /** Every call the replayer received, in order. */
   calls: [] as string[],
+  /**
+   * The images the replayed document reports; tests push fake <img> records
+   * shaped like HTMLImageElement (src, complete, naturalWidth, dataset).
+   */
+  images: [] as Array<{ src: string; complete: boolean; naturalWidth: number; referrerPolicy: string; dataset: Record<string, string> }>,
   /** Config the replayer was constructed with. */
   config: undefined as { root?: unknown; liveMode?: unknown } | undefined,
   /** Events the replayer was constructed with. */
@@ -27,6 +32,12 @@ const rrwebMock = vi.hoisted(() => ({
 
 vi.mock('rrweb', () => ({
   Replayer: class {
+    iframe = {
+      contentDocument: {
+        images: rrwebMock.images,
+      },
+    }
+
     constructor(events: unknown[], config: { root?: unknown; liveMode?: unknown }) {
       rrwebMock.calls.push('construct')
       rrwebMock.config = config
@@ -52,6 +63,7 @@ import { createRrwebMirror, liveBaseline } from '../../src/client/mirror.ts'
 
 beforeEach(() => {
   rrwebMock.calls.length = 0
+  rrwebMock.images.length = 0
   rrwebMock.config = undefined
   rrwebMock.eventsAtBuild = []
   rrwebMock.baseline = undefined
@@ -73,6 +85,36 @@ describe('rrweb replayer wiring', () => {
     expect(rrwebMock.baseline).toBe(1_700_000_000_000)
     expect(rrwebMock.calls).toEqual(['construct', 'startLive', 'add:4', 'add:2'])
     expect(handle).toBeDefined()
+  })
+
+  it('the replayed images are refitted to no-referrer, and a failed one is re-requested', async () => {
+    // Given a CDN that hotlink-protects: a foreign origin as Referer is a 403
+    // while an empty one is a 200 (measured on bilibili's). One image already
+    // failed under the panel's origin; one has not loaded yet.
+    vi.useFakeTimers()
+    try {
+      const broken = { src: 'https://cdn.test/a.png', complete: true, naturalWidth: 0, referrerPolicy: '', dataset: {} as Record<string, string> }
+      const fresh = { src: 'https://cdn.test/b.png', complete: false, naturalWidth: 0, referrerPolicy: '', dataset: {} as Record<string, string> }
+      rrwebMock.images.push(broken, fresh)
+
+      // When a checkpoint batch is applied
+      const handle = await createRrwebMirror(document.createElement('div'), [{ type: 2, timestamp: 1_700_000_000_000 }])
+      await vi.advanceTimersByTimeAsync(400)
+
+      // Then both carry the no-referrer policy and the already-failed one was
+      // re-requested - an image stays broken until it is asked for again
+      expect(broken.referrerPolicy).toBe('no-referrer')
+      expect(broken.dataset.refit).toBe('1')
+      expect(broken.src).toBe('https://cdn.test/a.png')
+      expect(fresh.referrerPolicy).toBe('no-referrer')
+      expect(fresh.dataset.refit).toBe('1')
+
+      // And teardown releases the pending refit without throwing
+      handle.destroy()
+      await vi.advanceTimersByTimeAsync(400)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('a live event reaches the running player and teardown destroys it', async () => {
