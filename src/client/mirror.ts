@@ -84,11 +84,59 @@ export async function createRrwebMirror(
   // `addEvent`, and this way the checkpoint batch and the events behind it
   // travel the same path.
   const replayer = new rrweb.Replayer([], { root, liveMode: true })
+  // The replayed page's images must not carry this panel's origin as their
+  // Referer: image CDNs that practise hotlink protection answer a foreign
+  // origin with 403 while still answering an empty one with 200 - measured on
+  // bilibili's CDN, and exactly the difference between "the mirror is broken"
+  // and a working picture.
+  //
+  // An attribute on the iframe cannot do this: the browsing context exists by
+  // the time the constructor returns, and its documents inherit the parent's
+  // policy at creation (measured - an iframe attribute set before `play` still
+  // sent the panel's Referer). The policy is per-image, applied to every image
+  // the replayed document has, and re-requested when it had already failed.
+  // Scheduled after each applied event and debounced, because a checkpoint
+  // applies hundreds of nodes and one walk covers them all.
+  const refitImages = (): void => {
+    const frame = (replayer as unknown as { iframe?: HTMLIFrameElement }).iframe
+    const doc = frame?.contentDocument
+    if (doc === undefined || doc === null) return
+    for (const image of Array.from(doc.images)) {
+      if (image.dataset.refit === '1') continue
+      image.dataset.refit = '1'
+      image.referrerPolicy = 'no-referrer'
+      // An image that already failed with the foreign Referer stays broken
+      // until it is asked for again; re-request it under the new policy.
+      if (image.complete && image.naturalWidth === 0 && image.src) {
+        const source = image.src
+        image.src = ''
+        image.src = source
+      }
+    }
+  }
+  let refitTimer: ReturnType<typeof setTimeout> | undefined
+  const scheduleRefit = (): void => {
+    if (refitTimer !== undefined) clearTimeout(refitTimer)
+    refitTimer = setTimeout(() => {
+      refitTimer = undefined
+      try {
+        refitImages()
+      } catch {
+        // The frame can be gone mid-teardown; a refit is never worth a throw.
+      }
+    }, 400)
+  }
   replayer.startLive(liveBaseline(events))
-  const append = (event: unknown): void => { replayer.addEvent(event as RecordedEvent) }
+  const append = (event: unknown): void => {
+    replayer.addEvent(event as RecordedEvent)
+    scheduleRefit()
+  }
   for (const event of events) append(event)
   return {
     addEvent: append,
-    destroy: () => { replayer.destroy() },
+    destroy: () => {
+      if (refitTimer !== undefined) clearTimeout(refitTimer)
+      replayer.destroy()
+    },
   }
 }
